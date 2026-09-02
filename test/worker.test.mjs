@@ -78,8 +78,12 @@ try {
     headers: { cookie },
   }), env, ctx);
   assert.equal(adminResponse.status, 200);
+  const adminHtml = await adminResponse.text();
+  const csrfToken = adminHtml.match(/name="_csrf" value="([^"]+)"/)?.[1];
+  assert.ok(csrfToken);
 
   const saveForm = new URLSearchParams({
+    _csrf: csrfToken,
     bot_token: "999:TEST_TOKEN",
     watched_sender_id: "123456789",
     alert_message: "سایت قطع شد",
@@ -90,7 +94,6 @@ try {
     method: "POST",
     headers: {
       cookie,
-      origin: "https://worker.example",
       "content-type": "application/x-www-form-urlencoded",
     },
     body: saveForm,
