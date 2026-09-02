@@ -479,24 +479,31 @@ function requireSameOrigin(request) {
   const origin = request.headers.get("origin");
   if (origin === expectedOrigin) return;
 
-  // Some mobile browsers omit Origin on ordinary same-origin HTML form POSTs.
-  // In that case, accept a same-origin Referer or the browser's Fetch Metadata
-  // signal while still rejecting explicit cross-origin submissions.
-  if (!origin) {
+  // Some mobile browsers either omit Origin or serialize it as "null" for a
+  // normal HTML form POST. Treat those as an absent signal, then reject only
+  // when Referer or Fetch Metadata explicitly identifies a cross-site request.
+  if (!origin || origin === "null") {
     const referer = request.headers.get("referer");
     if (referer) {
       try {
-        if (new URL(referer).origin === expectedOrigin) return;
-      } catch {
-        // Fall through to the generic invalid-request response below.
+        if (new URL(referer).origin !== expectedOrigin) throw invalidRequest();
+        return;
+      } catch (error) {
+        if (error?.status === 403) throw error;
+        throw invalidRequest();
       }
     }
-    if (request.headers.get("sec-fetch-site") === "same-origin") return;
+    if (request.headers.get("sec-fetch-site") === "cross-site") throw invalidRequest();
+    return;
   }
 
+  throw invalidRequest();
+}
+
+function invalidRequest() {
   const error = new Error("درخواست نامعتبر است؛ صفحه را دوباره باز کن.");
   error.status = 403;
-  throw error;
+  return error;
 }
 
 function normalizeId(value, label) {
