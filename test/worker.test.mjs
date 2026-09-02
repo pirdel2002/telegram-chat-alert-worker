@@ -36,12 +36,26 @@ try {
   const loginForm = new URLSearchParams({ password: env.ADMIN_PASSWORD });
   const loginResponse = await worker.fetch(new Request("https://worker.example/login", {
     method: "POST",
-    headers: { origin: "https://worker.example", "content-type": "application/x-www-form-urlencoded" },
+    headers: {
+      referer: "https://worker.example/login",
+      "sec-fetch-site": "same-origin",
+      "content-type": "application/x-www-form-urlencoded",
+    },
     body: loginForm,
   }), env, ctx);
   assert.equal(loginResponse.status, 303);
   const cookie = loginResponse.headers.get("set-cookie").split(";")[0];
   assert.match(cookie, /^ta_session=/);
+
+  const crossOriginLogin = await worker.fetch(new Request("https://worker.example/login", {
+    method: "POST",
+    headers: {
+      origin: "https://attacker.example",
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ password: env.ADMIN_PASSWORD }),
+  }), env, ctx);
+  assert.equal(crossOriginLogin.status, 403);
 
   const adminResponse = await worker.fetch(new Request("https://worker.example/admin", {
     headers: { cookie },
