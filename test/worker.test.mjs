@@ -47,6 +47,23 @@ try {
   const cookie = loginResponse.headers.get("set-cookie").split(";")[0];
   assert.match(cookie, /^ta_session=/);
 
+  const nullOriginLogin = await worker.fetch(new Request("https://worker.example/login", {
+    method: "POST",
+    headers: {
+      origin: "null",
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ password: env.ADMIN_PASSWORD }),
+  }), env, ctx);
+  assert.equal(nullOriginLogin.status, 303);
+
+  const missingOriginLogin = await worker.fetch(new Request("https://worker.example/login", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ password: env.ADMIN_PASSWORD }),
+  }), env, ctx);
+  assert.equal(missingOriginLogin.status, 303);
+
   const crossOriginLogin = await worker.fetch(new Request("https://worker.example/login", {
     method: "POST",
     headers: {
