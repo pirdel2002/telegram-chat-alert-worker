@@ -1,0 +1,25 @@
+{
+  "name": "telegram-chat-alert-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "cloudflare": {
+    "bindings": {
+      "CONFIG_STORE": {
+        "description": "فضای ذخیره تنظیمات پنل؛ هنگام نصب به‌صورت خودکار ساخته می‌شود."
+      },
+      "ADMIN_PASSWORD": {
+        "description": "یک رمز قوی و منحصربه‌فرد برای ورود به پنل انتخاب کنید. توکن ربات را اینجا وارد نکنید."
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check src/index.js",
+    "test": "node test/worker.test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.34.0"
+  }
+}
