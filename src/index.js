@@ -21,7 +21,8 @@ export default {
       }
 
       if (url.pathname === "/logout" && request.method === "POST") {
-        requireSameOrigin(request);
+        await requireAdmin(request, env);
+        await requireCsrf(request, env);
         return redirect("/login", expiredSessionCookie());
       }
 
@@ -33,19 +34,19 @@ export default {
 
       if (url.pathname === "/admin/save" && request.method === "POST") {
         await requireAdmin(request, env);
-        requireSameOrigin(request);
+        await requireCsrf(request, env);
         return await saveSettings(request, env);
       }
 
       if (url.pathname === "/admin/test" && request.method === "POST") {
         await requireAdmin(request, env);
-        requireSameOrigin(request);
+        await requireCsrf(request, env);
         return await sendTestAlert(request, env);
       }
 
       if (url.pathname === "/admin/disable" && request.method === "POST") {
         await requireAdmin(request, env);
-        requireSameOrigin(request);
+        await requireCsrf(request, env);
         return await disableWebhook(request, env);
       }
 
@@ -65,7 +66,7 @@ export default {
 };
 
 async function handleLogin(request, env) {
-  requireSameOrigin(request);
+  requireLoginFormRequest(request);
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const rateKey = `telegram-alert:login:${ip}`;
   const attempts = Number((await env.CONFIG_STORE.get(rateKey)) || "0");
@@ -94,7 +95,8 @@ async function renderAdmin(request, env, notice = "", isError = false) {
     "test-sent": "پیام آزمایشی ارسال شد.",
     disabled: "وب‌هوک و ارسال هشدار غیرفعال شد.",
   };
-  return html(adminPage(config, status, notice || notices[noticeCode] || "", isError));
+  const csrfToken = await csrfTokenForRequest(request, env);
+  return html(adminPage(config, status, notice || notices[noticeCode] || "", isError, csrfToken));
 }
 
 async function saveSettings(request, env) {
@@ -474,30 +476,35 @@ function parseCookies(header) {
   return result;
 }
 
-function requireSameOrigin(request) {
+function requireLoginFormRequest(request) {
   const expectedOrigin = new URL(request.url).origin;
   const origin = request.headers.get("origin");
-  if (origin === expectedOrigin) return;
+  if (origin && origin !== "null" && origin !== expectedOrigin) throw invalidRequest();
 
-  // Some mobile browsers either omit Origin or serialize it as "null" for a
-  // normal HTML form POST. Treat those as an absent signal, then reject only
-  // when Referer or Fetch Metadata explicitly identifies a cross-site request.
-  if (!origin || origin === "null") {
-    const referer = request.headers.get("referer");
-    if (referer) {
-      try {
-        if (new URL(referer).origin !== expectedOrigin) throw invalidRequest();
-        return;
-      } catch (error) {
-        if (error?.status === 403) throw error;
-        throw invalidRequest();
-      }
+  const referer = request.headers.get("referer");
+  if (referer) {
+    try {
+      if (new URL(referer).origin !== expectedOrigin) throw invalidRequest();
+    } catch (error) {
+      if (error?.status === 403) throw error;
+      throw invalidRequest();
     }
-    if (request.headers.get("sec-fetch-site") === "cross-site") throw invalidRequest();
-    return;
   }
 
-  throw invalidRequest();
+  if (request.headers.get("sec-fetch-site") === "cross-site") throw invalidRequest();
+}
+
+async function csrfTokenForRequest(request, env) {
+  const session = parseCookies(request.headers.get("cookie") || "").ta_session;
+  if (!session) throw invalidRequest();
+  return hmacSign(`csrf:${session}`, sessionSecret(env));
+}
+
+async function requireCsrf(request, env) {
+  const form = await request.clone().formData();
+  const supplied = String(form.get("_csrf") || "");
+  const expected = await csrfTokenForRequest(request, env);
+  if (!supplied || !constantTimeEqual(supplied, expected)) throw invalidRequest();
 }
 
 function invalidRequest() {
@@ -574,11 +581,12 @@ ${error ? `<div class="notice bad">${escapeHtml(error)}</div>` : ""}
 <p class="foot">توکن ربات در این پنل به‌صورت رمزنگاری‌شده نگهداری می‌شود.</p></main>`);
 }
 
-function adminPage(config, status, notice, isError) {
+function adminPage(config, status, notice, isError, csrfToken) {
   const noticeText = notice;
   const connected = Boolean(config.ownerChatId && config.connectionEnabled !== false);
   const botReady = Boolean(config.tokenCipher && config.botUsername);
   const enabled = Boolean(config.enabled);
+  const csrfInput = `<input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}">`;
   return layout("پنل هشدار تلگرام", `<main class="wrap"><div class="brand"><div class="logo">🔔</div><div><h1>پنل هشدار تلگرام</h1><p>اعلان پیام یک فرستنده مشخص از Chat Automation</p></div></div>
 ${noticeText ? `<div class="notice${isError ? " bad" : ""}">${escapeHtml(noticeText)}</div>` : ""}
 <section class="card"><div class="status">
@@ -587,14 +595,14 @@ ${noticeText ? `<div class="notice${isError ? " bad" : ""}">${escapeHtml(noticeT
 <div class="stat"><span class="muted">شناسه حساب مالک</span><b>${escapeHtml(config.ownerChatId || "هنوز دریافت نشده")}</b></div>
 <div class="stat"><span class="muted">آخرین رویداد</span><b>${escapeHtml(status.lastAction || "هنوز رویدادی ثبت نشده")}</b></div>
 </div></section>
-<section class="card"><form method="post" action="/admin/save"><div class="grid">
+<section class="card"><form method="post" action="/admin/save">${csrfInput}<div class="grid">
 <div class="full"><label for="bot_token">توکن ربات</label><input id="bot_token" name="bot_token" type="password" autocomplete="off" placeholder="${config.tokenCipher ? "برای حفظ توکن فعلی خالی بگذار" : "123456:ABC..."}"><p class="hint">توکن بعد از ذخیره دوباره نمایش داده نمی‌شود.</p></div>
 <div><label for="watched_sender_id">شناسه عددی فرستنده هدف</label><input id="watched_sender_id" name="watched_sender_id" inputmode="numeric" value="${escapeHtml(config.watchedSenderId || "")}" placeholder="123456789" required><p class="hint">@username قابل قبول نیست.</p></div>
 <div><label for="cooldown_seconds">فاصله جلوگیری از تکرار (ثانیه)</label><input id="cooldown_seconds" name="cooldown_seconds" type="number" min="0" max="86400" value="${escapeHtml(String(config.cooldownSeconds ?? 300))}"><p class="hint">۰ یعنی هر پیام یک هشدار؛ پیشنهاد: ۳۰۰.</p></div>
 <div class="full"><label for="alert_message">متن هشدار</label><textarea id="alert_message" name="alert_message" maxlength="4096" required>${escapeHtml(config.alertMessage || "سایت قطع شد")}</textarea></div>
 <div class="full check"><input id="enabled" name="enabled" type="checkbox" ${enabled ? "checked" : ""}><label for="enabled">ارسال هشدار فعال باشد</label></div>
 </div><div class="actions"><button type="submit">ذخیره و فعال‌سازی وب‌هوک</button></div></form>
-<div class="divider"></div><div class="actions"><form method="post" action="/admin/test"><button class="secondary" type="submit">ارسال پیام آزمایشی</button></form><form method="post" action="/admin/disable"><button class="danger" type="submit">غیرفعال‌کردن وب‌هوک</button></form><form method="post" action="/logout"><button class="secondary" type="submit">خروج</button></form></div>
+<div class="divider"></div><div class="actions"><form method="post" action="/admin/test">${csrfInput}<button class="secondary" type="submit">ارسال پیام آزمایشی</button></form><form method="post" action="/admin/disable">${csrfInput}<button class="danger" type="submit">غیرفعال‌کردن وب‌هوک</button></form><form method="post" action="/logout">${csrfInput}<button class="secondary" type="submit">خروج</button></form></div>
 </section><section class="card"><b>ترتیب راه‌اندازی</b><ol class="hint"><li>تنظیمات بالا را ذخیره کن.</li><li>در BotFather برای ربات Secretary Mode را فعال کن.</li><li>در Telegram → Settings → Chat Automation ربات را وصل کن.</li><li>ترجیحاً Only selected chats را انتخاب و فقط چت هدف را اضافه کن.</li><li>به پنل برگرد و پیام آزمایشی بفرست.</li></ol></section></main>`);
 }
 
