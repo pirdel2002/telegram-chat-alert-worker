@@ -475,12 +475,28 @@ function parseCookies(header) {
 }
 
 function requireSameOrigin(request) {
+  const expectedOrigin = new URL(request.url).origin;
   const origin = request.headers.get("origin");
-  if (!origin || origin !== new URL(request.url).origin) {
-    const error = new Error("درخواست نامعتبر است؛ صفحه را دوباره باز کن.");
-    error.status = 403;
-    throw error;
+  if (origin === expectedOrigin) return;
+
+  // Some mobile browsers omit Origin on ordinary same-origin HTML form POSTs.
+  // In that case, accept a same-origin Referer or the browser's Fetch Metadata
+  // signal while still rejecting explicit cross-origin submissions.
+  if (!origin) {
+    const referer = request.headers.get("referer");
+    if (referer) {
+      try {
+        if (new URL(referer).origin === expectedOrigin) return;
+      } catch {
+        // Fall through to the generic invalid-request response below.
+      }
+    }
+    if (request.headers.get("sec-fetch-site") === "same-origin") return;
   }
+
+  const error = new Error("درخواست نامعتبر است؛ صفحه را دوباره باز کن.");
+  error.status = 403;
+  throw error;
 }
 
 function normalizeId(value, label) {
