@@ -9,10 +9,5 @@
       "binding": "CONFIG_STORE",
       "id": "00000000000000000000000000000000"
     }
-  ],
-  "secrets": {
-    "required": [
-      "ADMIN_PASSWORD"
-    ]
-  }
+  ]
 }
