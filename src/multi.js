@@ -4,16 +4,19 @@ const LEGACY_CONFIG_KEY = "telegram-alert:config:v1";
 const STATUS_PREFIX = "telegram-alert:status:v2:";
 const MESSAGE_PREFIX = "telegram-alert:message:v1:";
 const LAST_MESSAGE_PREFIX = "telegram-alert:last-message:v1:";
+const KV_HISTORY_MIGRATION_KEY = "telegram-alert:d1-migration:v1";
 const MESSAGE_PAGE_SIZE = 50;
 const DISPLAY_TIME_ZONE = "Asia/Tehran";
 const SESSION_SECONDS = 12 * 60 * 60;
 const LOGIN_WINDOW_SECONDS = 10 * 60;
 const MAX_LOGIN_ATTEMPTS = 5;
+const readyDatabases = new WeakSet();
 
 export default {
   async fetch(request, env, ctx) {
     try {
       assertBindings(env);
+      await ensureMessageDatabase(env);
       const url = new URL(request.url);
       const webhookMatch = url.pathname.match(/^\/telegram-webhook\/([A-Za-z0-9_-]{4,80})$/);
 
@@ -52,6 +55,7 @@ export default {
         "/admin/sender/delete": deleteSender,
         "/admin/rule/save": saveRule,
         "/admin/rule/delete": deleteRule,
+        "/admin/chat-log/toggle": toggleChatLog,
       };
       if (adminActions[url.pathname] && request.method === "POST") {
         await requireAdmin(request, env);
@@ -97,12 +101,13 @@ async function handleLogin(request, env) {
 
 async function renderAdmin(request, env) {
   const state = await loadState(env);
+  await migrateKvHistoryToD1(env);
   const url = new URL(request.url);
   const statuses = {};
   await Promise.all(state.bots.map(async function (bot) {
     const values = await Promise.all([
       env.CONFIG_STORE.get(statusKey(bot.id), "json"),
-      loadLastMessage(env, bot.id),
+      loadLastMessageFromD1(env, bot.id),
     ]);
     statuses[bot.id] = Object.assign({}, values[0] || {}, values[1] || {});
   }));
@@ -116,6 +121,8 @@ async function renderAdmin(request, env) {
     "sender-deleted": "فرستنده و قوانین مرتبط با آن حذف شد.",
     "rule-saved": "قانون ذخیره شد.",
     "rule-deleted": "قانون حذف شد.",
+    "chat-log-enabled": "ثبت پیام‌های این سمت چت فعال شد.",
+    "chat-log-disabled": "ثبت پیام‌های این سمت چت غیرفعال شد؛ هشدارها همچنان فعال‌اند.",
   };
   const csrfToken = await csrfTokenForRequest(request, env);
   const allowedTabs = ["overview", "messages", "bots", "bot-new", "bot-edit", "senders", "sender-new", "rules", "rule-new", "guide"];
@@ -125,7 +132,7 @@ async function renderAdmin(request, env) {
   const cursor = String(url.searchParams.get("cursor") || "");
   const messagePage = activeTab === "messages"
     ? await loadMessagePage(env, cursor.length <= 2048 ? cursor : "")
-    : { items: [], nextCursor: "" };
+    : { items: [], nextCursor: "", sources: [] };
   return html(adminPage(state, statuses, notices[noticeCode] || "", csrfToken, activeTab, selectedBotId, messagePage));
 }
 
@@ -186,6 +193,7 @@ async function saveBot(request, env) {
     ownerChatId: sameTelegramBot ? (existing.ownerChatId || "") : "",
     businessConnectionId: sameTelegramBot ? (existing.businessConnectionId || "") : "",
     connectionEnabled: sameTelegramBot ? existing.connectionEnabled !== false : false,
+    connections: sameTelegramBot && Array.isArray(existing.connections) ? existing.connections : [],
     senders: existing ? existing.senders : [],
     rules: existing ? existing.rules : [],
     updatedAt: new Date().toISOString(),
@@ -206,17 +214,25 @@ async function testBot(request, env) {
   const form = await request.formData();
   const state = await loadState(env);
   const bot = requireBot(state, form.get("bot_id"));
-  if (!bot.ownerChatId) {
+  const ownerChatIds = activeConnections(bot).map(function (connection) {
+    return connection.ownerChatId;
+  }).filter(Boolean).filter(function (value, index, list) {
+    return list.indexOf(value) === index;
+  });
+  if (!ownerChatIds.length && bot.ownerChatId) ownerChatIds.push(bot.ownerChatId);
+  if (!ownerChatIds.length) {
     throw badRequest("هنوز حساب مالک برای این بات ثبت نشده است. بات را در Chat Automation متصل کن.");
   }
   const token = await decryptSecret(bot.tokenCipher, encryptionSecret(env));
-  await telegramApi(token, "sendMessage", {
-    chat_id: bot.ownerChatId,
-    text: "🧪 پیام آزمایشی از " + bot.label,
-    disable_notification: false,
-  });
+  await Promise.all(ownerChatIds.map(function (chatId) {
+    return telegramApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: "🧪 پیام آزمایشی از " + bot.label,
+      disable_notification: false,
+    });
+  }));
   await saveStatus(env, bot.id, {
-    lastAction: "پیام آزمایشی ارسال شد",
+    lastAction: "پیام آزمایشی برای " + ownerChatIds.length + " حساب ارسال شد",
     lastActionAt: new Date().toISOString(),
   });
   return redirect("/admin?tab=overview&notice=bot-tested");
@@ -247,7 +263,13 @@ async function deleteBot(request, env) {
   await telegramApi(token, "deleteWebhook", { drop_pending_updates: false });
   state.bots = state.bots.filter(function (item) { return item.id !== bot.id; });
   await saveState(env, state);
-  await env.CONFIG_STORE.delete(statusKey(bot.id));
+  await Promise.all([
+    env.CONFIG_STORE.delete(statusKey(bot.id)),
+    env.MESSAGE_DB.batch([
+      env.MESSAGE_DB.prepare("DELETE FROM messages WHERE bot_id = ?").bind(bot.id),
+      env.MESSAGE_DB.prepare("DELETE FROM chat_sources WHERE bot_id = ?").bind(bot.id),
+    ]),
+  ]);
   return redirect("/admin?tab=bots&notice=bot-deleted");
 }
 
@@ -362,6 +384,18 @@ async function deleteRule(request, env) {
   return redirect("/admin?tab=rules&bot=" + encodeURIComponent(bot.id) + "&notice=rule-deleted");
 }
 
+async function toggleChatLog(request, env) {
+  const form = await request.formData();
+  const sourceKey = String(form.get("source_key") || "");
+  if (!sourceKey || sourceKey.length > 500) throw badRequest("منبع چت معتبر نیست.");
+  const enabled = form.get("log_enabled") === "on" ? 1 : 0;
+  const result = await env.MESSAGE_DB.prepare(
+    "UPDATE chat_sources SET log_enabled = ?, updated_at = ? WHERE source_key = ?",
+  ).bind(enabled, Math.floor(Date.now() / 1000), sourceKey).run();
+  if (!result.meta || Number(result.meta.changes) < 1) throw badRequest("منبع چت پیدا نشد.");
+  return redirect("/admin?tab=messages&notice=" + (enabled ? "chat-log-enabled" : "chat-log-disabled"));
+}
+
 async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   if (request.method !== "POST") return methodNotAllowed();
   const state = await loadState(env);
@@ -382,14 +416,26 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
 
   if (update.business_connection) {
     const connection = update.business_connection;
-    bot.ownerChatId = String(connection.user_chat_id || (connection.user && connection.user.id) || "");
-    bot.businessConnectionId = String(connection.id || "");
-    bot.connectionEnabled = Boolean(connection.is_enabled);
+    const connectionId = String(connection.id || "");
+    const ownerChatId = String(connection.user_chat_id || (connection.user && connection.user.id) || "");
+    const storedConnection = {
+      id: connectionId,
+      ownerChatId: ownerChatId,
+      ownerName: telegramDisplayName(connection.user, "حساب متصل"),
+      enabled: Boolean(connection.is_enabled),
+      updatedAt: new Date().toISOString(),
+    };
+    const connectionIndex = bot.connections.findIndex(function (item) { return item.id === connectionId; });
+    if (connectionIndex >= 0) bot.connections[connectionIndex] = storedConnection;
+    else bot.connections.push(storedConnection);
+    bot.ownerChatId = ownerChatId;
+    bot.businessConnectionId = connectionId;
+    bot.connectionEnabled = activeConnections(bot).length > 0;
     bot.updatedAt = new Date().toISOString();
     await saveState(env, state);
     await saveStatus(env, bot.id, {
       connection: connection.is_enabled ? "connected" : "disconnected",
-      ownerChatId: bot.ownerChatId,
+      ownerChatId: ownerChatId,
       lastAction: connection.is_enabled ? "حساب تلگرام متصل شد" : "اتصال حساب تلگرام قطع شد",
       lastActionAt: new Date().toISOString(),
     });
@@ -400,7 +446,9 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
       && String(update.message.text || "").startsWith("/start")) {
     const senderId = String((update.message.from && update.message.from.id) || "");
     const token = await decryptSecret(bot.tokenCipher, encryptionSecret(env));
-    const isOwner = Boolean(bot.ownerChatId) && senderId === bot.ownerChatId;
+    const isOwner = activeConnections(bot).some(function (connection) {
+      return senderId === connection.ownerChatId;
+    }) || (Boolean(bot.ownerChatId) && senderId === bot.ownerChatId);
     ctx.waitUntil(telegramApi(token, "sendMessage", {
       chat_id: String(update.message.chat.id),
       text: isOwner
@@ -418,13 +466,17 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   const configuredSender = bot.senders.find(function (sender) {
     return sender.enabled && sender.telegramId === senderId;
   });
-  const direction = bot.ownerChatId && senderId === String(bot.ownerChatId) ? "outgoing" : "incoming";
-  const messageRecord = buildMessageRecord(bot, message, update.update_id, configuredSender, direction);
+  const connection = await resolveMessageConnection(bot, message, env, state);
+  const direction = connection.ownerChatId && senderId === connection.ownerChatId ? "outgoing" : "incoming";
+  const messageRecord = buildMessageRecord(bot, message, update.update_id, configuredSender, direction, connection);
+  const logEnabled = await upsertChatSource(env, messageRecord);
   await Promise.all([
-    saveMessage(env, messageRecord),
+    logEnabled ? saveMessage(env, messageRecord) : Promise.resolve(),
     saveStatus(env, bot.id, {
       lastSenderId: senderId,
       lastSenderLabel: configuredSender ? configuredSender.label : "",
+      lastObservedAt: messageRecord.timestamp,
+      lastObservedLogging: logEnabled,
     }),
   ]);
 
@@ -451,7 +503,8 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
     return new Response("OK");
   }
 
-  if (!bot.ownerChatId) {
+  const alertOwnerChatId = connection.ownerChatId || bot.ownerChatId;
+  if (!alertOwnerChatId) {
     await saveStatus(env, bot.id, {
       lastSenderId: senderId,
       lastSenderLabel: configuredSender ? configuredSender.label : "",
@@ -484,7 +537,7 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   const alertPromise = Promise.allSettled(readyRules.map(async function (rule) {
     try {
       await telegramApiWithRetry(token, "sendMessage", {
-        chat_id: bot.ownerChatId,
+        chat_id: alertOwnerChatId,
         text: rule.alertMessage,
         disable_notification: false,
       });
@@ -510,6 +563,69 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   });
   ctx.waitUntil(alertPromise);
   return new Response("OK");
+}
+
+async function ensureMessageDatabase(env) {
+  if (readyDatabases.has(env.MESSAGE_DB)) return;
+  await env.MESSAGE_DB.exec(
+    "CREATE TABLE IF NOT EXISTS messages ("
+      + "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+      + "event_key TEXT NOT NULL UNIQUE,"
+      + "source_key TEXT NOT NULL,"
+      + "bot_id TEXT NOT NULL,"
+      + "direction TEXT NOT NULL,"
+      + "sent_at INTEGER NOT NULL,"
+      + "payload_cipher TEXT NOT NULL,"
+      + "created_at INTEGER NOT NULL"
+      + ");"
+      + "CREATE INDEX IF NOT EXISTS idx_messages_time ON messages(sent_at DESC, id DESC);"
+      + "CREATE INDEX IF NOT EXISTS idx_messages_bot_time ON messages(bot_id, sent_at DESC, id DESC);"
+      + "CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source_key);"
+      + "CREATE TABLE IF NOT EXISTS chat_sources ("
+      + "source_key TEXT PRIMARY KEY,"
+      + "bot_id TEXT NOT NULL,"
+      + "business_connection_id TEXT NOT NULL,"
+      + "chat_id TEXT NOT NULL,"
+      + "conversation_key TEXT NOT NULL,"
+      + "owner_id TEXT NOT NULL,"
+      + "log_enabled INTEGER NOT NULL DEFAULT 1,"
+      + "label_cipher TEXT NOT NULL,"
+      + "updated_at INTEGER NOT NULL"
+      + ");"
+      + "CREATE INDEX IF NOT EXISTS idx_chat_sources_updated ON chat_sources(updated_at DESC);"
+      + "CREATE INDEX IF NOT EXISTS idx_chat_sources_conversation ON chat_sources(conversation_key);",
+  );
+  readyDatabases.add(env.MESSAGE_DB);
+}
+
+async function migrateKvHistoryToD1(env) {
+  if (await env.CONFIG_STORE.get(KV_HISTORY_MIGRATION_KEY)) return;
+  let cursor = "";
+  do {
+    const options = { prefix: MESSAGE_PREFIX, limit: 100 };
+    if (cursor) options.cursor = cursor;
+    const page = await env.CONFIG_STORE.list(options);
+    const statements = [];
+    for (const key of page.keys) {
+      const cipher = await env.CONFIG_STORE.get(key.name);
+      const message = await decryptMessagePayload(env, cipher);
+      if (!message) continue;
+      statements.push(env.MESSAGE_DB.prepare(
+        "INSERT OR IGNORE INTO messages (event_key, source_key, bot_id, direction, sent_at, payload_cipher, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).bind(
+        "kv|" + key.name,
+        "legacy|" + String(message.botId || "unknown"),
+        String(message.botId || "unknown"),
+        message.direction === "outgoing" ? "outgoing" : "incoming",
+        Number(message.timestamp) || Math.floor(Date.now() / 1000),
+        cipher,
+        Math.floor(Date.now() / 1000),
+      ));
+    }
+    if (statements.length) await env.MESSAGE_DB.batch(statements);
+    cursor = page.list_complete ? "" : String(page.cursor || "");
+  } while (cursor);
+  await env.CONFIG_STORE.put(KV_HISTORY_MIGRATION_KEY, new Date().toISOString());
 }
 
 async function loadState(env) {
@@ -538,6 +654,13 @@ async function loadState(env) {
       ownerChatId: String(old.ownerChatId || ""),
       businessConnectionId: String(old.businessConnectionId || ""),
       connectionEnabled: old.connectionEnabled !== false,
+      connections: old.businessConnectionId && old.ownerChatId ? [{
+        id: String(old.businessConnectionId),
+        ownerChatId: String(old.ownerChatId),
+        ownerName: "حساب متصل قبلی",
+        enabled: old.connectionEnabled !== false,
+        updatedAt: old.updatedAt || "",
+      }] : [],
       senders: [],
       rules: [],
       updatedAt: new Date().toISOString(),
@@ -564,6 +687,23 @@ function normalizeState(state) {
         ownerChatId: String(bot.ownerChatId || ""),
         businessConnectionId: String(bot.businessConnectionId || ""),
         connectionEnabled: bot.connectionEnabled !== false,
+        connections: Array.isArray(bot.connections) && bot.connections.length
+          ? bot.connections.map(function (connection) {
+            return {
+              id: String(connection.id || ""),
+              ownerChatId: String(connection.ownerChatId || ""),
+              ownerName: String(connection.ownerName || "حساب متصل"),
+              enabled: connection.enabled !== false,
+              updatedAt: connection.updatedAt || "",
+            };
+          }).filter(function (connection) { return connection.id; })
+          : (bot.businessConnectionId && bot.ownerChatId ? [{
+            id: String(bot.businessConnectionId),
+            ownerChatId: String(bot.ownerChatId),
+            ownerName: "حساب متصل قبلی",
+            enabled: bot.connectionEnabled !== false,
+            updatedAt: bot.updatedAt || "",
+          }] : []),
         senders: Array.isArray(bot.senders) ? bot.senders.map(function (sender) {
           return {
             id: String(sender.id),
@@ -603,7 +743,7 @@ async function saveStatus(env, botId, patch) {
   await env.CONFIG_STORE.put(key, JSON.stringify(Object.assign({}, current, patch)));
 }
 
-function buildMessageRecord(bot, message, updateId, configuredSender, direction) {
+function buildMessageRecord(bot, message, updateId, configuredSender, direction, connection) {
   const timestamp = Number(message.date) > 0 ? Number(message.date) : Math.floor(Date.now() / 1000);
   const senderName = configuredSender
     ? configuredSender.label
@@ -611,10 +751,19 @@ function buildMessageRecord(bot, message, updateId, configuredSender, direction)
   const chatName = telegramDisplayName(message.chat, senderName);
   const uniqueId = String(updateId == null ? (message.message_id || randomToken(6)) : updateId)
     .replace(/[^A-Za-z0-9_-]/g, "_");
+  const chatId = String((message.chat && message.chat.id) || "unknown");
+  const connectionId = String(connection.id || "legacy");
+  const participants = [String(connection.ownerChatId || "unknown"), chatId].sort();
   return {
-    key: messageKey(timestamp, bot.id, uniqueId),
+    eventKey: bot.id + "|" + connectionId + "|" + uniqueId,
+    sourceKey: bot.id + "|" + connectionId + "|" + chatId,
+    conversationKey: bot.id + "|" + participants.join("|"),
     botId: bot.id,
     botLabel: bot.label,
+    connectionId: connectionId,
+    ownerId: String(connection.ownerChatId || ""),
+    ownerName: String(connection.ownerName || "حساب متصل"),
+    chatId: chatId,
     senderName: senderName,
     chatName: chatName,
     direction: direction,
@@ -625,56 +774,145 @@ function buildMessageRecord(bot, message, updateId, configuredSender, direction)
 }
 
 async function saveMessage(env, record) {
-  const stored = Object.assign({}, record);
-  delete stored.key;
-  const cipher = await encryptSecret(JSON.stringify(stored), encryptionSecret(env));
-  await Promise.all([
-    env.CONFIG_STORE.put(record.key, cipher),
-    env.CONFIG_STORE.put(LAST_MESSAGE_PREFIX + record.botId, cipher),
-  ]);
+  const cipher = await encryptSecret(JSON.stringify(record), encryptionSecret(env));
+  await env.MESSAGE_DB.prepare(
+    "INSERT OR IGNORE INTO messages (event_key, source_key, bot_id, direction, sent_at, payload_cipher, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).bind(
+    record.eventKey,
+    record.sourceKey,
+    record.botId,
+    record.direction,
+    record.timestamp,
+    cipher,
+    Math.floor(Date.now() / 1000),
+  ).run();
 }
 
 async function loadMessagePage(env, cursor) {
-  const options = { prefix: MESSAGE_PREFIX, limit: MESSAGE_PAGE_SIZE };
-  if (cursor) options.cursor = cursor;
-  const result = await env.CONFIG_STORE.list(options);
-  const items = (await Promise.all(result.keys.map(async function (item) {
-    const cipher = await env.CONFIG_STORE.get(item.name);
-    if (!cipher) return null;
-    try {
-      return JSON.parse(await decryptSecret(cipher, encryptionSecret(env)));
-    } catch (error) {
-      console.warn("Could not decrypt stored message", item.name, error);
-      return null;
-    }
+  const cursorMatch = String(cursor || "").match(/^(\d+):(\d+)$/);
+  const sql = cursorMatch
+    ? "SELECT id, sent_at, payload_cipher FROM messages WHERE sent_at < ? OR (sent_at = ? AND id < ?) ORDER BY sent_at DESC, id DESC LIMIT ?"
+    : "SELECT id, sent_at, payload_cipher FROM messages ORDER BY sent_at DESC, id DESC LIMIT ?";
+  const statement = env.MESSAGE_DB.prepare(sql);
+  const result = cursorMatch
+    ? await statement.bind(Number(cursorMatch[1]), Number(cursorMatch[1]), Number(cursorMatch[2]), MESSAGE_PAGE_SIZE + 1).all()
+    : await statement.bind(MESSAGE_PAGE_SIZE + 1).all();
+  const rows = result.results || [];
+  const pageRows = rows.slice(0, MESSAGE_PAGE_SIZE);
+  const items = (await Promise.all(pageRows.map(function (row) {
+    return decryptMessagePayload(env, row.payload_cipher);
   }))).filter(Boolean);
+  const lastRow = pageRows[pageRows.length - 1];
   return {
     items: items,
-    nextCursor: result.list_complete ? "" : String(result.cursor || ""),
+    nextCursor: rows.length > MESSAGE_PAGE_SIZE && lastRow ? lastRow.sent_at + ":" + lastRow.id : "",
+    sources: await loadChatSources(env),
   };
 }
 
-async function loadLastMessage(env, botId) {
-  const cipher = await env.CONFIG_STORE.get(LAST_MESSAGE_PREFIX + botId);
+async function loadLastMessageFromD1(env, botId) {
+  const row = await env.MESSAGE_DB.prepare(
+    "SELECT payload_cipher FROM messages WHERE bot_id = ? ORDER BY sent_at DESC, id DESC LIMIT 1",
+  ).bind(botId).first();
+  if (!row) return null;
+  const message = await decryptMessagePayload(env, row.payload_cipher);
+  return message ? {
+    lastMessageText: message.text,
+    lastMessageSenderName: message.senderName,
+    lastMessageAt: message.timestamp,
+    lastMessageDirection: message.direction,
+  } : null;
+}
+
+async function decryptMessagePayload(env, cipher) {
   if (!cipher) return null;
   try {
-    const message = JSON.parse(await decryptSecret(cipher, encryptionSecret(env)));
-    return {
-      lastMessageText: message.text,
-      lastMessageSenderName: message.senderName,
-      lastMessageAt: message.timestamp,
-      lastMessageDirection: message.direction,
-    };
+    return JSON.parse(await decryptSecret(cipher, encryptionSecret(env)));
   } catch (error) {
-    console.warn("Could not decrypt last message", botId, error);
+    console.warn("Could not decrypt D1 message", error);
     return null;
   }
 }
 
-function messageKey(timestamp, botId, uniqueId) {
-  const milliseconds = Math.max(0, Math.floor(Number(timestamp) * 1000));
-  const reverseTime = String(9999999999999 - milliseconds).padStart(13, "0");
-  return MESSAGE_PREFIX + reverseTime + ":" + botId + ":" + uniqueId;
+async function upsertChatSource(env, record) {
+  const labelCipher = await encryptSecret(JSON.stringify({
+    ownerName: record.ownerName,
+    chatName: record.chatName,
+    botLabel: record.botLabel,
+  }), encryptionSecret(env));
+  const row = await env.MESSAGE_DB.prepare(
+    "INSERT INTO chat_sources (source_key, bot_id, business_connection_id, chat_id, conversation_key, owner_id, log_enabled, label_cipher, updated_at) "
+      + "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT(source_key) DO UPDATE SET "
+      + "conversation_key = excluded.conversation_key, owner_id = excluded.owner_id, label_cipher = excluded.label_cipher, updated_at = excluded.updated_at "
+      + "RETURNING log_enabled",
+  ).bind(
+    record.sourceKey,
+    record.botId,
+    record.connectionId,
+    record.chatId,
+    record.conversationKey,
+    record.ownerId,
+    labelCipher,
+    Math.floor(Date.now() / 1000),
+  ).first();
+  return !row || Number(row.log_enabled) !== 0;
+}
+
+async function loadChatSources(env) {
+  const result = await env.MESSAGE_DB.prepare(
+    "SELECT source_key, bot_id, business_connection_id, chat_id, conversation_key, owner_id, log_enabled, label_cipher, updated_at "
+      + "FROM chat_sources ORDER BY updated_at DESC LIMIT 200",
+  ).all();
+  return (await Promise.all((result.results || []).map(async function (row) {
+    try {
+      const labels = JSON.parse(await decryptSecret(row.label_cipher, encryptionSecret(env)));
+      return Object.assign({}, row, labels, { logEnabled: Number(row.log_enabled) !== 0 });
+    } catch (error) {
+      console.warn("Could not decrypt chat source", row.source_key, error);
+      return null;
+    }
+  }))).filter(Boolean);
+}
+
+async function resolveMessageConnection(bot, message, env, state) {
+  const connectionId = String(message.business_connection_id || bot.businessConnectionId || "legacy");
+  const stored = bot.connections.find(function (connection) { return connection.id === connectionId; });
+  if (stored) return stored;
+  if (message.business_connection_id) {
+    try {
+      const token = await decryptSecret(bot.tokenCipher, encryptionSecret(env));
+      const remote = await telegramApi(token, "getBusinessConnection", {
+        business_connection_id: connectionId,
+      });
+      if (remote && remote.id) {
+        const recovered = {
+          id: String(remote.id),
+          ownerChatId: String(remote.user_chat_id || (remote.user && remote.user.id) || ""),
+          ownerName: telegramDisplayName(remote.user, "حساب متصل"),
+          enabled: Boolean(remote.is_enabled),
+          updatedAt: new Date().toISOString(),
+        };
+        bot.connections.push(recovered);
+        bot.updatedAt = new Date().toISOString();
+        await saveState(env, state);
+        return recovered;
+      }
+    } catch (error) {
+      console.warn("Could not recover business connection", connectionId, error);
+    }
+  }
+  return {
+    id: connectionId,
+    ownerChatId: String(bot.ownerChatId || ""),
+    ownerName: "حساب متصل",
+    enabled: bot.connectionEnabled !== false,
+  };
+}
+
+function activeConnections(bot) {
+  return (Array.isArray(bot.connections) ? bot.connections : []).filter(function (connection) {
+    return connection.enabled !== false && connection.ownerChatId;
+  });
 }
 
 function telegramDisplayName(entity, fallback) {
@@ -773,6 +1011,7 @@ async function telegramApiWithRetry(token, method, payload, attempts) {
 function assertBindings(env) {
   const missing = [];
   if (!env.CONFIG_STORE) missing.push("CONFIG_STORE (KV binding)");
+  if (!env.MESSAGE_DB) missing.push("MESSAGE_DB (D1 binding)");
   if (!env.ADMIN_PASSWORD) missing.push("ADMIN_PASSWORD");
   if (missing.length) throw new Error("تنظیمات Cloudflare ناقص است: " + missing.join(", "));
 }
@@ -982,9 +1221,9 @@ function layout(title, content) {
     ".hint{color:var(--muted);font-size:12px;line-height:1.8;margin:6px 0 0}.check{display:flex;gap:9px;align-items:center}.check input{width:auto;accent-color:var(--accent)}button{border:0;border-radius:12px;padding:11px 15px;background:var(--accent);color:white;font:inherit;font-weight:bold;cursor:pointer}.secondary{background:#213752}.danger{background:#6b2533}",
     ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}.actions form{margin:0}.status{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.stat{background:#091626;border:1px solid var(--line);padding:11px;border-radius:12px}.stat b{display:block;margin-top:5px;font-size:13px;word-break:break-word}.muted{color:var(--muted)}",
     ".notice{padding:13px 15px;border-radius:12px;margin-bottom:16px;background:#123b33;border:1px solid #1b6a58}.pill{display:inline-flex;padding:4px 9px;border-radius:999px;background:#174438;color:#8ef0d2;font-size:12px}.pill.off{background:#46232e;color:#ffb1bf}.divider{height:1px;background:var(--line);margin:18px 0}.rule{background:#0a1728;border:1px solid var(--line);border-radius:15px;padding:14px;margin-top:12px}",
-    ".chat-card{padding:12px}.chat-stream{display:flex;flex-direction:column;gap:9px;background:#071321;border-radius:15px;padding:16px;min-height:220px}.bubble{width:fit-content;max-width:min(76%,680px);border:1px solid var(--line);border-radius:16px;padding:10px 12px;box-shadow:0 8px 20px #0003}.bubble.incoming{margin-right:auto;background:#12243a;border-bottom-left-radius:4px}.bubble.outgoing{margin-left:auto;background:#164537;border-color:#256653;border-bottom-right-radius:4px}.bubble-head{display:flex;gap:8px;align-items:center;justify-content:space-between;color:#8fc8ff;font-size:12px;margin-bottom:6px}.bubble.outgoing .bubble-head{color:#8ef0d2}.bubble-text{white-space:normal;overflow-wrap:anywhere;line-height:1.8}.bubble-meta{display:flex;gap:8px;justify-content:flex-end;color:var(--muted);font-size:10px;margin-top:6px}.day{align-self:center;background:#1c3149;color:#cfe3f8;border-radius:999px;padding:5px 11px;font-size:11px;margin:8px 0}.last-message{display:block;line-height:1.7}.last-message small{display:block;color:var(--muted);font-weight:normal}.pager{display:flex;justify-content:center;margin:14px 0}.privacy-note{margin-bottom:12px;padding:10px 12px;border-radius:12px;background:#302912;color:#f7d98c;font-size:12px}",
+    ".chat-card{padding:12px}.chat-stream{display:flex;flex-direction:column;gap:9px;background:#071321;border-radius:15px;padding:16px;min-height:220px}.bubble{width:fit-content;max-width:min(76%,680px);border:1px solid var(--line);border-radius:16px;padding:10px 12px;box-shadow:0 8px 20px #0003}.bubble.incoming{margin-right:auto;background:#12243a;border-bottom-left-radius:4px}.bubble.outgoing{margin-left:auto;background:#164537;border-color:#256653;border-bottom-right-radius:4px}.bubble-head{display:flex;gap:8px;align-items:center;justify-content:space-between;color:#8fc8ff;font-size:12px;margin-bottom:6px}.bubble.outgoing .bubble-head{color:#8ef0d2}.bubble-text{white-space:normal;overflow-wrap:anywhere;line-height:1.8}.bubble-meta{display:flex;gap:8px;justify-content:flex-end;color:var(--muted);font-size:10px;margin-top:6px}.day{align-self:center;background:#1c3149;color:#cfe3f8;border-radius:999px;padding:5px 11px;font-size:11px;margin:8px 0}.last-message{display:block;line-height:1.7}.last-message small{display:block;color:var(--muted);font-weight:normal}.pager{display:flex;justify-content:center;margin:14px 0}.privacy-note{margin-bottom:12px;padding:10px 12px;border-radius:12px;background:#183349;color:#b9d9f4;font-size:12px}.source-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:16px}.source{background:#0a1728;border:1px solid var(--line);border-radius:15px;padding:13px}.source h3{margin-bottom:6px}.source .actions{margin-top:10px}.source .actions button{width:100%}",
     ".login{width:min(430px,calc(100% - 28px));margin:14vh auto}.login button{width:100%;margin-top:14px}.foot{color:var(--muted);text-align:center;font-size:11px;margin-top:16px}.empty{padding:15px;border:1px dashed var(--line);border-radius:12px;color:var(--muted)}",
-    "@media(max-width:760px){.shell{display:block}.sidebar{position:static;margin-bottom:12px;padding:9px}.nav{flex-direction:row;overflow-x:auto}.nav a{white-space:nowrap}.botlinks,.side-title{display:none}.grid,.status{grid-template-columns:1fr}.full{grid-column:auto}.wrap{margin-top:12px}.card{padding:16px}.bothead,.pagehead{display:block}.bothead .pill,.pagehead .btn{margin-top:9px}.actions button,.actions .btn{width:100%}.actions form{flex:1 1 100%}}",
+    "@media(max-width:760px){.shell{display:block}.sidebar{position:static;margin-bottom:12px;padding:9px}.nav{flex-direction:row;overflow-x:auto}.nav a{white-space:nowrap}.botlinks,.side-title{display:none}.grid,.status,.source-grid{grid-template-columns:1fr}.full{grid-column:auto}.wrap{margin-top:12px}.card{padding:16px}.bothead,.pagehead{display:block}.bothead .pill,.pagehead .btn{margin-top:9px}.actions button,.actions .btn{width:100%}.actions form{flex:1 1 100%}}",
   ].join("");
   return "<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'>"
     + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -1079,7 +1318,7 @@ function renderTab(activeTab, state, bot, statuses, csrf, messagePage) {
       + "<section class='card'>" + ruleEditor(bot, null, csrf) + "</section>";
   }
   if (activeTab === "bots") return botsTab(state, statuses, csrf);
-  if (activeTab === "messages") return messagesTab(messagePage);
+  if (activeTab === "messages") return messagesTab(messagePage, csrf);
   if (activeTab === "senders") return sendersTab(state, bot, csrf);
   if (activeTab === "rules") return rulesTab(state, bot, csrf);
   if (activeTab === "guide") return guideTab(csrf);
@@ -1090,7 +1329,7 @@ function overviewTab(state, statuses, csrf) {
   const senderCount = state.bots.reduce(function (sum, bot) { return sum + bot.senders.length; }, 0);
   const ruleCount = state.bots.reduce(function (sum, bot) { return sum + bot.rules.length; }, 0);
   const connectedCount = state.bots.filter(function (bot) {
-    return bot.ownerChatId && bot.connectionEnabled !== false;
+    return activeConnections(bot).length > 0 || (bot.ownerChatId && bot.connectionEnabled !== false);
   }).length;
   const cards = state.bots.map(function (bot) {
     return botSummary(bot, statuses[bot.id] || {}, csrf);
@@ -1111,7 +1350,8 @@ function botsTab(state, statuses, csrf) {
 }
 
 function botSummary(bot, status, csrf) {
-  const connected = Boolean(bot.ownerChatId && bot.connectionEnabled !== false);
+  const connectionCount = activeConnections(bot).length || (bot.ownerChatId && bot.connectionEnabled !== false ? 1 : 0);
+  const connected = connectionCount > 0;
   const lastMessage = status.lastMessageAt
     ? "<span class='last-message'>" + escapeHtml(status.lastMessageSenderName || "ناشناس")
       + "<small>" + escapeHtml(shortText(status.lastMessageText || "پیام غیرمتنی", 80))
@@ -1121,7 +1361,7 @@ function botSummary(bot, status, csrf) {
     + "<div class='hint'>@" + escapeHtml(bot.botUsername || "نامشخص") + "</div></div>"
     + "<span class='pill" + (bot.enabled ? "" : " off") + "'>" + (bot.enabled ? "فعال" : "غیرفعال") + "</span></div>"
     + "<div class='status'>"
-    + stat("Chat Automation", connected ? "<span class='pill'>متصل</span>" : "<span class='pill off'>منتظر اتصال</span>", true)
+    + stat("Chat Automation", connected ? "<span class='pill'>" + connectionCount + " اتصال</span>" : "<span class='pill off'>منتظر اتصال</span>", true)
     + stat("فرستنده‌ها", String(bot.senders.length))
     + stat("هشدارها", String(bot.rules.length))
     + stat("آخرین پیام", lastMessage, true)
@@ -1132,7 +1372,7 @@ function botSummary(bot, status, csrf) {
     + "</div></section>";
 }
 
-function messagesTab(messagePage) {
+function messagesTab(messagePage, csrf) {
   const chronological = (messagePage.items || []).slice().reverse();
   let previousDay = "";
   const messages = chronological.map(function (message) {
@@ -1152,10 +1392,34 @@ function messagesTab(messagePage) {
       + encodeURIComponent(messagePage.nextCursor) + "'>نمایش ۵۰ پیام قدیمی‌تر</a></div>"
     : "";
   return pageHeader("پیام‌ها", "پیام‌های خوانده‌شده توسط همه بات‌ها، از قدیمی به جدید در هر صفحه", "", "")
-    + "<div class='privacy-note'>تاریخچه بدون حذف خودکار در KV ذخیره می‌شود. برای حجم بالای پیام، انتقال به D1 لازم خواهد شد.</div>"
+    + "<div class='privacy-note'>تاریخچه رمزنگاری‌شده در D1 نگهداری می‌شود. اگر یک گفتگو از دو حساب به همین بات وصل است، لاگ یکی از دو سمت را خاموش کن؛ هشدار آن سمت همچنان کار می‌کند.</div>"
+    + chatSourcesPanel(messagePage.sources || [], csrf)
     + (messages
       ? "<section class='card chat-card'><div class='chat-stream'>" + messages + "</div></section>" + older
       : "<section class='card empty'>هنوز پیامی توسط بات‌ها خوانده نشده است.</section>");
+}
+
+function chatSourcesPanel(sources, csrf) {
+  if (!sources.length) return "<section class='card empty'>پس از رسیدن اولین پیام، کلید روشن/خاموش لاگ هر سمت چت اینجا ظاهر می‌شود.</section>";
+  const counts = {};
+  sources.forEach(function (source) {
+    counts[source.conversation_key] = (counts[source.conversation_key] || 0) + 1;
+  });
+  const cards = sources.map(function (source) {
+    const mirrored = counts[source.conversation_key] > 1;
+    return "<div class='source'><div class='bothead'><div><h3>" + escapeHtml(source.ownerName || "حساب متصل")
+      + " ↔ " + escapeHtml(source.chatName || "گفتگو") + "</h3><div class='hint'>بات: "
+      + escapeHtml(source.botLabel || "بات") + " · لاگ این سمت</div></div><span class='pill"
+      + (source.logEnabled ? "" : " off") + "'>" + (source.logEnabled ? "فعال" : "غیرفعال") + "</span></div>"
+      + (mirrored ? "<div class='hint'>دو سمت این گفتگو شناسایی شده؛ فقط یکی را فعال نگه دار.</div>" : "")
+      + "<form method='post' action='/admin/chat-log/toggle' class='actions'>" + csrf
+      + hidden("source_key", source.source_key)
+      + (source.logEnabled ? "" : hidden("log_enabled", "on"))
+      + "<button class='" + (source.logEnabled ? "danger" : "secondary") + "' type='submit'>"
+      + (source.logEnabled ? "غیرفعال‌کردن لاگ این سمت" : "فعال‌کردن لاگ این سمت")
+      + "</button></form></div>";
+  }).join("");
+  return "<section class='card'><h2>کنترل لاگ چت‌ها</h2><div class='source-grid'>" + cards + "</div></section>";
 }
 
 function sendersTab(state, bot, csrf) {
