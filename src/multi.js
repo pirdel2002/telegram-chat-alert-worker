@@ -1,4 +1,5 @@
-const STATE_KEY = "telegram-alert:state:v2";
+const STATE_KEY = "telegram-alert:state:v3";
+const V2_STATE_KEY = "telegram-alert:state:v2";
 const LEGACY_CONFIG_KEY = "telegram-alert:config:v1";
 const STATUS_PREFIX = "telegram-alert:status:v2:";
 const SESSION_SECONDS = 12 * 60 * 60;
@@ -33,6 +34,7 @@ export default {
           ok: true,
           bots: state.bots.length,
           enabledBots: state.bots.filter(function (bot) { return bot.enabled; }).length,
+          senders: state.bots.reduce(function (count, bot) { return count + bot.senders.length; }, 0),
           rules: state.bots.reduce(function (count, bot) { return count + bot.rules.length; }, 0),
         });
       }
@@ -42,6 +44,8 @@ export default {
         "/admin/bot/test": testBot,
         "/admin/bot/disable": disableBot,
         "/admin/bot/delete": deleteBot,
+        "/admin/sender/save": saveSender,
+        "/admin/sender/delete": deleteSender,
         "/admin/rule/save": saveRule,
         "/admin/rule/delete": deleteRule,
       };
@@ -89,21 +93,28 @@ async function handleLogin(request, env) {
 
 async function renderAdmin(request, env) {
   const state = await loadState(env);
+  const url = new URL(request.url);
   const statuses = {};
   await Promise.all(state.bots.map(async function (bot) {
     statuses[bot.id] = (await env.CONFIG_STORE.get(statusKey(bot.id), "json")) || {};
   }));
-  const noticeCode = new URL(request.url).searchParams.get("notice") || "";
+  const noticeCode = url.searchParams.get("notice") || "";
   const notices = {
     "bot-saved": "بات ذخیره شد و وب‌هوک آن فعال است.",
     "bot-tested": "پیام آزمایشی ارسال شد.",
     "bot-disabled": "وب‌هوک بات غیرفعال شد.",
     "bot-deleted": "بات و قوانین آن حذف شد.",
+    "sender-saved": "فرستنده ذخیره شد.",
+    "sender-deleted": "فرستنده و قوانین مرتبط با آن حذف شد.",
     "rule-saved": "قانون ذخیره شد.",
     "rule-deleted": "قانون حذف شد.",
   };
   const csrfToken = await csrfTokenForRequest(request, env);
-  return html(adminPage(state, statuses, notices[noticeCode] || "", csrfToken));
+  const allowedTabs = ["overview", "bots", "bot-new", "bot-edit", "senders", "sender-new", "rules", "rule-new", "guide"];
+  const requestedTab = url.searchParams.get("tab") || "overview";
+  const activeTab = allowedTabs.includes(requestedTab) ? requestedTab : "overview";
+  const selectedBotId = url.searchParams.get("bot") || "";
+  return html(adminPage(state, statuses, notices[noticeCode] || "", csrfToken, activeTab, selectedBotId));
 }
 
 async function saveBot(request, env) {
@@ -163,6 +174,7 @@ async function saveBot(request, env) {
     ownerChatId: sameTelegramBot ? (existing.ownerChatId || "") : "",
     businessConnectionId: sameTelegramBot ? (existing.businessConnectionId || "") : "",
     connectionEnabled: sameTelegramBot ? existing.connectionEnabled !== false : false,
+    senders: existing ? existing.senders : [],
     rules: existing ? existing.rules : [],
     updatedAt: new Date().toISOString(),
   };
@@ -175,7 +187,7 @@ async function saveBot(request, env) {
     lastAction: "بات ذخیره و وب‌هوک فعال شد",
     lastActionAt: new Date().toISOString(),
   });
-  return redirect("/admin?notice=bot-saved");
+  return redirect("/admin?tab=bots&notice=bot-saved");
 }
 
 async function testBot(request, env) {
@@ -195,7 +207,7 @@ async function testBot(request, env) {
     lastAction: "پیام آزمایشی ارسال شد",
     lastActionAt: new Date().toISOString(),
   });
-  return redirect("/admin?notice=bot-tested");
+  return redirect("/admin?tab=overview&notice=bot-tested");
 }
 
 async function disableBot(request, env) {
@@ -212,7 +224,7 @@ async function disableBot(request, env) {
     lastAction: "وب‌هوک بات غیرفعال شد",
     lastActionAt: new Date().toISOString(),
   });
-  return redirect("/admin?notice=bot-disabled");
+  return redirect("/admin?tab=bots&notice=bot-disabled");
 }
 
 async function deleteBot(request, env) {
@@ -224,7 +236,61 @@ async function deleteBot(request, env) {
   state.bots = state.bots.filter(function (item) { return item.id !== bot.id; });
   await saveState(env, state);
   await env.CONFIG_STORE.delete(statusKey(bot.id));
-  return redirect("/admin?notice=bot-deleted");
+  return redirect("/admin?tab=bots&notice=bot-deleted");
+}
+
+async function saveSender(request, env) {
+  const form = await request.formData();
+  const state = await loadState(env);
+  const bot = requireBot(state, form.get("bot_id"));
+  const submittedSenderId = String(form.get("sender_id") || "");
+  const senderId = submittedSenderId
+    ? requireSafeId(submittedSenderId, "شناسه داخلی فرستنده")
+    : "sender_" + randomToken(9);
+  const telegramId = normalizeTelegramId(form.get("telegram_id"));
+  const label = String(form.get("label") || "").trim();
+  const enabled = form.get("enabled") === "on";
+
+  if (!label || label.length > 80) throw badRequest("نام فرستنده باید بین ۱ تا ۸۰ نویسه باشد.");
+  const duplicate = bot.senders.find(function (sender) {
+    return sender.telegramId === telegramId && sender.id !== senderId;
+  });
+  if (duplicate) throw badRequest("این شناسه عددی قبلاً برای همین بات ثبت شده است.");
+
+  const sender = {
+    id: senderId,
+    telegramId: telegramId,
+    label: label,
+    enabled: enabled,
+    updatedAt: new Date().toISOString(),
+  };
+  const senderIndex = bot.senders.findIndex(function (item) { return item.id === senderId; });
+  if (senderIndex >= 0) bot.senders[senderIndex] = sender;
+  else bot.senders.push(sender);
+  bot.updatedAt = new Date().toISOString();
+  await saveState(env, state);
+  return redirect("/admin?tab=senders&bot=" + encodeURIComponent(bot.id) + "&notice=sender-saved");
+}
+
+async function deleteSender(request, env) {
+  const form = await request.formData();
+  const state = await loadState(env);
+  const bot = requireBot(state, form.get("bot_id"));
+  const senderId = requireSafeId(String(form.get("sender_id") || ""), "شناسه داخلی فرستنده");
+  if (!bot.senders.some(function (sender) { return sender.id === senderId; })) {
+    throw badRequest("فرستنده پیدا نشد.");
+  }
+  const removedRuleIds = bot.rules
+    .filter(function (rule) { return rule.senderRef === senderId; })
+    .map(function (rule) { return rule.id; });
+  bot.senders = bot.senders.filter(function (sender) { return sender.id !== senderId; });
+  bot.rules = bot.rules.filter(function (rule) { return rule.senderRef !== senderId; });
+  bot.updatedAt = new Date().toISOString();
+  await saveState(env, state);
+  await Promise.all(removedRuleIds.map(function (ruleId) {
+    return env.CONFIG_STORE.delete(cooldownKey(bot.id, ruleId));
+  }));
+  return redirect("/admin?tab=senders&bot=" + encodeURIComponent(bot.id) + "&notice=sender-deleted");
 }
 
 async function saveRule(request, env) {
@@ -233,19 +299,29 @@ async function saveRule(request, env) {
   const bot = requireBot(state, form.get("bot_id"));
   const submittedRuleId = String(form.get("rule_id") || "");
   const ruleId = submittedRuleId ? requireSafeId(submittedRuleId, "شناسه قانون") : "rule_" + randomToken(9);
+  const senderRef = String(form.get("sender_ref") || "*");
+  const matchType = String(form.get("match_type") || "contains");
   const keyword = String(form.get("keyword") || "").trim();
   const alertMessage = String(form.get("alert_message") || "").trim();
   const cooldownSeconds = clampInteger(form.get("cooldown_seconds"), 0, 86400, 300);
   const enabled = form.get("enabled") === "on";
 
-  if (!keyword || keyword.length > 200) throw badRequest("عبارت تریگر باید بین ۱ تا ۲۰۰ نویسه باشد.");
+  if (senderRef !== "*" && !bot.senders.some(function (sender) { return sender.id === senderRef; })) {
+    throw badRequest("فرستنده انتخاب‌شده معتبر نیست.");
+  }
+  if (!["any", "contains"].includes(matchType)) throw badRequest("نوع فیلتر پیام معتبر نیست.");
+  if (matchType === "contains" && (!keyword || keyword.length > 200)) {
+    throw badRequest("عبارت فیلتر باید بین ۱ تا ۲۰۰ نویسه باشد.");
+  }
   if (!alertMessage || alertMessage.length > 4096) {
     throw badRequest("متن پیام هشدار باید بین ۱ تا ۴۰۹۶ نویسه باشد.");
   }
 
   const rule = {
     id: ruleId,
-    keyword: keyword,
+    senderRef: senderRef,
+    matchType: matchType,
+    keyword: matchType === "contains" ? keyword : "",
     alertMessage: alertMessage,
     cooldownSeconds: cooldownSeconds,
     enabled: enabled,
@@ -256,7 +332,7 @@ async function saveRule(request, env) {
   else bot.rules.push(rule);
   bot.updatedAt = new Date().toISOString();
   await saveState(env, state);
-  return redirect("/admin?notice=rule-saved");
+  return redirect("/admin?tab=rules&bot=" + encodeURIComponent(bot.id) + "&notice=rule-saved");
 }
 
 async function deleteRule(request, env) {
@@ -271,7 +347,7 @@ async function deleteRule(request, env) {
   bot.updatedAt = new Date().toISOString();
   await saveState(env, state);
   await env.CONFIG_STORE.delete(cooldownKey(bot.id, ruleId));
-  return redirect("/admin?notice=rule-deleted");
+  return redirect("/admin?tab=rules&bot=" + encodeURIComponent(bot.id) + "&notice=rule-deleted");
 }
 
 async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
@@ -327,13 +403,25 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   const senderId = String((message.from && message.from.id) || "");
   const incomingText = String(message.text || message.caption || "");
   const normalizedIncoming = normalizeText(incomingText);
+  const configuredSender = bot.senders.find(function (sender) {
+    return sender.enabled && sender.telegramId === senderId;
+  });
   const matchedRules = bot.rules.filter(function (rule) {
-    return rule.enabled && normalizedIncoming.includes(normalizeText(rule.keyword));
+    if (!rule.enabled) return false;
+    if (rule.senderRef !== "*") {
+      const selectedSender = bot.senders.find(function (sender) {
+        return sender.id === rule.senderRef && sender.enabled;
+      });
+      if (!selectedSender || selectedSender.telegramId !== senderId) return false;
+    }
+    if (rule.matchType === "any") return true;
+    return Boolean(rule.keyword) && normalizedIncoming.includes(normalizeText(rule.keyword));
   });
 
   if (!matchedRules.length) {
     await saveStatus(env, bot.id, {
       lastSenderId: senderId,
+      lastSenderLabel: configuredSender ? configuredSender.label : "",
       lastAction: "پیام دریافت شد؛ هیچ تریگری منطبق نبود",
       lastActionAt: new Date().toISOString(),
     });
@@ -343,6 +431,7 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   if (!bot.ownerChatId) {
     await saveStatus(env, bot.id, {
       lastSenderId: senderId,
+      lastSenderLabel: configuredSender ? configuredSender.label : "",
       lastAction: "تریگر منطبق شد، اما شناسه مالک هنوز ثبت نشده بود",
       lastActionAt: new Date().toISOString(),
     });
@@ -361,6 +450,7 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   if (!readyRules.length) {
     await saveStatus(env, bot.id, {
       lastSenderId: senderId,
+      lastSenderLabel: configuredSender ? configuredSender.label : "",
       lastAction: "تریگر منطبق شد، اما در فاصله جلوگیری از تکرار بود",
       lastActionAt: new Date().toISOString(),
     });
@@ -385,6 +475,7 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
     const failureCount = results.length - successCount;
     await saveStatus(env, bot.id, {
       lastSenderId: senderId,
+      lastSenderLabel: configuredSender ? configuredSender.label : "",
       lastMatchedRules: readyRules.length,
       lastAction: failureCount
         ? successCount + " هشدار ارسال شد و " + failureCount + " هشدار شکست خورد"
@@ -402,8 +493,15 @@ async function loadState(env) {
   const stored = await env.CONFIG_STORE.get(STATE_KEY, "json");
   if (stored && Array.isArray(stored.bots)) return normalizeState(stored);
 
+  const v2 = await env.CONFIG_STORE.get(V2_STATE_KEY, "json");
+  if (v2 && Array.isArray(v2.bots)) {
+    const migrated = normalizeState(v2);
+    await saveState(env, migrated);
+    return migrated;
+  }
+
   const old = await env.CONFIG_STORE.get(LEGACY_CONFIG_KEY, "json");
-  const state = { version: 2, bots: [], updatedAt: new Date().toISOString() };
+  const state = { version: 3, bots: [], updatedAt: new Date().toISOString() };
   if (old && old.tokenCipher) {
     state.bots.push({
       id: "legacy_" + String(old.botId || "bot").replace(/[^A-Za-z0-9_-]/g, ""),
@@ -417,6 +515,7 @@ async function loadState(env) {
       ownerChatId: String(old.ownerChatId || ""),
       businessConnectionId: String(old.businessConnectionId || ""),
       connectionEnabled: old.connectionEnabled !== false,
+      senders: [],
       rules: [],
       updatedAt: new Date().toISOString(),
     });
@@ -427,7 +526,7 @@ async function loadState(env) {
 
 function normalizeState(state) {
   return {
-    version: 2,
+    version: 3,
     updatedAt: state.updatedAt || "",
     bots: state.bots.map(function (bot) {
       return {
@@ -442,9 +541,20 @@ function normalizeState(state) {
         ownerChatId: String(bot.ownerChatId || ""),
         businessConnectionId: String(bot.businessConnectionId || ""),
         connectionEnabled: bot.connectionEnabled !== false,
+        senders: Array.isArray(bot.senders) ? bot.senders.map(function (sender) {
+          return {
+            id: String(sender.id),
+            telegramId: String(sender.telegramId || ""),
+            label: String(sender.label || sender.telegramId || "فرستنده"),
+            enabled: sender.enabled !== false,
+            updatedAt: sender.updatedAt || "",
+          };
+        }) : [],
         rules: Array.isArray(bot.rules) ? bot.rules.map(function (rule) {
           return {
             id: String(rule.id),
+            senderRef: String(rule.senderRef || "*"),
+            matchType: rule.matchType === "any" ? "any" : "contains",
             keyword: String(rule.keyword || ""),
             alertMessage: String(rule.alertMessage || ""),
             cooldownSeconds: clampInteger(rule.cooldownSeconds, 0, 86400, 300),
@@ -459,7 +569,7 @@ function normalizeState(state) {
 }
 
 async function saveState(env, state) {
-  state.version = 2;
+  state.version = 3;
   state.updatedAt = new Date().toISOString();
   await env.CONFIG_STORE.put(STATE_KEY, JSON.stringify(state));
 }
@@ -480,6 +590,14 @@ function requireBot(state, value) {
 function requireSafeId(value, label) {
   if (!/^[A-Za-z0-9_-]{4,80}$/.test(value)) throw badRequest(label + " نامعتبر است.");
   return value;
+}
+
+function normalizeTelegramId(value) {
+  const id = String(value || "").trim();
+  if (!/^-?\d{1,20}$/.test(id)) {
+    throw badRequest("شناسه فرستنده باید عددی باشد، نه username.");
+  }
+  return id;
 }
 
 function statusKey(botId) {
@@ -733,16 +851,17 @@ function layout(title, content) {
   const css = [
     ":root{color-scheme:dark;--bg:#07111f;--card:#101d30;--line:#243853;--text:#eef6ff;--muted:#9db0c9;--accent:#3aa0ff;--good:#2dd4a8;--bad:#ff647c}",
     "*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#102744 0,var(--bg) 48%);font-family:Tahoma,Arial,sans-serif;color:var(--text);min-height:100vh}",
-    ".wrap{width:min(900px,calc(100% - 24px));margin:28px auto}.brand{display:flex;align-items:center;gap:12px;margin-bottom:18px}.logo{display:grid;place-items:center;width:50px;height:50px;border-radius:15px;background:linear-gradient(135deg,#2495ff,#2dd4a8);font-size:25px}",
+    ".wrap{width:min(1180px,calc(100% - 24px));margin:22px auto}.brand{display:flex;align-items:center;gap:12px;margin-bottom:18px}.logo{display:grid;place-items:center;width:50px;height:50px;border-radius:15px;background:linear-gradient(135deg,#2495ff,#2dd4a8);font-size:25px}",
     "h1{font-size:22px;margin:0}h2{font-size:19px;margin:0 0 16px}h3{font-size:16px;margin:0}.brand p{margin:5px 0 0;color:var(--muted);font-size:13px}",
     ".card{background:color-mix(in srgb,var(--card) 94%,transparent);border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:0 20px 50px #0005;margin-bottom:16px}.bot{border-color:#315477}",
-    ".bothead{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:15px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}",
-    "label{display:block;color:#c8d8eb;font-size:13px;margin:0 0 7px}input,textarea{width:100%;border:1px solid var(--line);background:#081525;color:var(--text);border-radius:12px;padding:12px 13px;font:inherit;outline:none}input:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px #3aa0ff22}textarea{min-height:86px;resize:vertical}",
+    ".shell{display:grid;grid-template-columns:230px minmax(0,1fr);gap:16px;align-items:start}.sidebar{position:sticky;top:16px;background:#0b192b;border:1px solid var(--line);border-radius:20px;padding:14px}.side-title{font-size:12px;color:var(--muted);margin:8px 8px}.nav{display:flex;flex-direction:column;gap:6px}.nav a,.botlink{display:block;color:#cfe3f8;text-decoration:none;padding:10px 12px;border-radius:11px}.nav a:hover,.nav a.active,.botlink:hover{background:#193553;color:white}.botlinks{border-top:1px solid var(--line);margin-top:12px;padding-top:10px}.main{min-width:0}.tabs{display:flex;gap:7px;overflow-x:auto;margin-bottom:14px;padding-bottom:3px}.tab{white-space:nowrap;color:#b9cce2;text-decoration:none;background:#10233a;border:1px solid var(--line);border-radius:999px;padding:9px 13px}.tab.active{background:var(--accent);color:white;border-color:var(--accent)}",
+    ".pagehead{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border-radius:12px;padding:11px 15px;background:var(--accent);color:white;font-weight:bold}.btn.secondary{background:#213752}.bothead{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:15px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}",
+    "label{display:block;color:#c8d8eb;font-size:13px;margin:0 0 7px}input,textarea,select{width:100%;border:1px solid var(--line);background:#081525;color:var(--text);border-radius:12px;padding:12px 13px;font:inherit;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #3aa0ff22}textarea{min-height:86px;resize:vertical}",
     ".hint{color:var(--muted);font-size:12px;line-height:1.8;margin:6px 0 0}.check{display:flex;gap:9px;align-items:center}.check input{width:auto;accent-color:var(--accent)}button{border:0;border-radius:12px;padding:11px 15px;background:var(--accent);color:white;font:inherit;font-weight:bold;cursor:pointer}.secondary{background:#213752}.danger{background:#6b2533}",
     ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}.actions form{margin:0}.status{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.stat{background:#091626;border:1px solid var(--line);padding:11px;border-radius:12px}.stat b{display:block;margin-top:5px;font-size:13px;word-break:break-word}.muted{color:var(--muted)}",
     ".notice{padding:13px 15px;border-radius:12px;margin-bottom:16px;background:#123b33;border:1px solid #1b6a58}.pill{display:inline-flex;padding:4px 9px;border-radius:999px;background:#174438;color:#8ef0d2;font-size:12px}.pill.off{background:#46232e;color:#ffb1bf}.divider{height:1px;background:var(--line);margin:18px 0}.rule{background:#0a1728;border:1px solid var(--line);border-radius:15px;padding:14px;margin-top:12px}",
     ".login{width:min(430px,calc(100% - 28px));margin:14vh auto}.login button{width:100%;margin-top:14px}.foot{color:var(--muted);text-align:center;font-size:11px;margin-top:16px}.empty{padding:15px;border:1px dashed var(--line);border-radius:12px;color:var(--muted)}",
-    "@media(max-width:700px){.grid,.status{grid-template-columns:1fr}.full{grid-column:auto}.wrap{margin-top:16px}.card{padding:16px}.bothead{display:block}.bothead .pill{margin-top:8px}.actions button{width:100%}.actions form{flex:1 1 100%}}",
+    "@media(max-width:760px){.shell{display:block}.sidebar{position:static;margin-bottom:12px;padding:9px}.nav{flex-direction:row;overflow-x:auto}.nav a{white-space:nowrap}.botlinks,.side-title{display:none}.grid,.status{grid-template-columns:1fr}.full{grid-column:auto}.wrap{margin-top:12px}.card{padding:16px}.bothead,.pagehead{display:block}.bothead .pill,.pagehead .btn{margin-top:9px}.actions button,.actions .btn{width:100%}.actions form{flex:1 1 100%}}",
   ].join("");
   return "<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'>"
     + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -761,48 +880,186 @@ function loginPage(error) {
     + "<p class='foot'>توکن بات‌ها به‌صورت رمزنگاری‌شده نگهداری می‌شود.</p></main>");
 }
 
-function adminPage(state, statuses, notice, csrfToken) {
+function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId) {
   const csrf = csrfInput(csrfToken);
-  const bots = state.bots.map(function (bot) {
-    return botCard(bot, statuses[bot.id] || {}, csrf);
+  const selectedBot = state.bots.find(function (bot) { return bot.id === selectedBotId; })
+    || state.bots[0] || null;
+  const section = ["bot-new", "bot-edit"].includes(activeTab) ? "bots"
+    : ["sender-new"].includes(activeTab) ? "senders"
+    : ["rule-new"].includes(activeTab) ? "rules"
+    : activeTab;
+  const tabs = [
+    ["overview", "نمای کلی"],
+    ["bots", "بات‌ها"],
+    ["senders", "فرستنده‌ها"],
+    ["rules", "هشدارها"],
+    ["guide", "راهنما"],
+  ].map(function (item) {
+    const botPart = selectedBot && ["senders", "rules"].includes(item[0]) ? "&bot=" + encodeURIComponent(selectedBot.id) : "";
+    return "<a class='tab" + (section === item[0] ? " active" : "") + "' href='/admin?tab="
+      + item[0] + botPart + "'>" + item[1] + "</a>";
   }).join("");
-  const content = "<main class='wrap'><div class='brand'><div class='logo'>🔔</div><div>"
-    + "<h1>پنل چندبات هشدار تلگرام</h1><p>برای هر بات چند تریگر عبارتی و پیام مستقل تعریف کن.</p></div></div>"
+  const sidebarBots = state.bots.map(function (bot) {
+    return "<a class='botlink' href='/admin?tab=rules&bot=" + encodeURIComponent(bot.id) + "'>🤖 "
+      + escapeHtml(bot.label) + "</a>";
+  }).join("");
+  const sidebar = "<aside class='sidebar'><div class='side-title'>دسترسی سریع</div><nav class='nav'>"
+    + sideLink("overview", "⌂ نمای کلی", section)
+    + sideLink("bots", "🤖 مدیریت بات‌ها", section)
+    + sideLink("senders", "👤 فرستنده‌ها", section, selectedBot)
+    + sideLink("rules", "🔔 هشدارها", section, selectedBot)
+    + sideLink("guide", "؟ راهنما", section)
+    + "</nav><div class='botlinks'><div class='side-title'>بات‌ها</div>"
+    + (sidebarBots || "<div class='hint'>هنوز باتی نیست</div>") + "</div>"
+    + "<form method='post' action='/logout' class='actions'>" + csrf
+    + "<button class='secondary' type='submit'>خروج</button></form></aside>";
+  const content = renderTab(activeTab, state, selectedBot, statuses, csrf);
+  const page = "<main class='wrap'><div class='brand'><div class='logo'>🔔</div><div>"
+    + "<h1>پنل هشدار تلگرام</h1><p>چند بات، چند فرستنده و چند فیلتر مستقل</p></div></div>"
+    + "<div class='tabs'>" + tabs + "</div>"
     + (notice ? "<div class='notice'>" + escapeHtml(notice) + "</div>" : "")
-    + "<section class='card'><h2>افزودن بات جدید</h2>"
-    + botForm(null, csrf)
-    + "</section>"
-    + (bots || "<section class='card empty'>هنوز باتی اضافه نشده است.</section>")
-    + "<section class='card'><h2>راهنمای سریع</h2><ol class='hint'>"
-    + "<li>بات را با توکن BotFather اضافه کن.</li><li>Secretary Mode را برای همان بات فعال کن.</li>"
-    + "<li>بات را در Telegram → Settings → Chat Automation متصل کن.</li>"
-    + "<li>برای بات یک یا چند عبارت تریگر و پیام هشدار بساز.</li>"
-    + "<li>بات فقط متن و کپشن پیام‌ها را بررسی می‌کند و متن دریافتی را ذخیره نمی‌کند.</li></ol>"
-    + "<form method='post' action='/logout'>" + csrf + "<button class='secondary' type='submit'>خروج</button></form></section></main>";
-  return layout("پنل چندبات هشدار تلگرام", content);
+    + "<div class='shell'>" + sidebar + "<section class='main'>" + content + "</section></div></main>";
+  return layout("پنل هشدار تلگرام", page);
 }
 
-function botCard(bot, status, csrf) {
+function sideLink(tab, label, activeSection, bot) {
+  const botPart = bot ? "&bot=" + encodeURIComponent(bot.id) : "";
+  return "<a class='" + (activeSection === tab ? "active" : "") + "' href='/admin?tab=" + tab + botPart + "'>"
+    + label + "</a>";
+}
+
+function renderTab(activeTab, state, bot, statuses, csrf) {
+  if (activeTab === "bot-new") {
+    return pageHeader("افزودن بات جدید", "", "/admin?tab=bots", "بازگشت")
+      + "<section class='card'>" + botForm(null, csrf) + "</section>";
+  }
+  if (activeTab === "bot-edit") {
+    if (!bot) return emptyBots();
+    return pageHeader("ویرایش " + bot.label, "", "/admin?tab=bots", "بازگشت")
+      + "<section class='card'>" + botForm(bot, csrf)
+      + "<div class='divider'></div><div class='actions'>"
+      + actionForm("/admin/bot/test", bot.id, csrf, "پیام آزمایشی", "secondary")
+      + actionForm("/admin/bot/disable", bot.id, csrf, "غیرفعال‌کردن وب‌هوک", "danger")
+      + actionForm("/admin/bot/delete", bot.id, csrf, "حذف کامل بات", "danger")
+      + "</div></section>";
+  }
+  if (activeTab === "sender-new") {
+    if (!bot) return emptyBots();
+    return pageHeader("افزودن فرستنده به " + bot.label, "", "/admin?tab=senders&bot=" + encodeURIComponent(bot.id), "بازگشت")
+      + "<section class='card'>" + senderForm(bot, null, csrf) + "</section>";
+  }
+  if (activeTab === "rule-new") {
+    if (!bot) return emptyBots();
+    return pageHeader("افزودن هشدار به " + bot.label, "", "/admin?tab=rules&bot=" + encodeURIComponent(bot.id), "بازگشت")
+      + "<section class='card'>" + ruleEditor(bot, null, csrf) + "</section>";
+  }
+  if (activeTab === "bots") return botsTab(state, statuses, csrf);
+  if (activeTab === "senders") return sendersTab(state, bot, csrf);
+  if (activeTab === "rules") return rulesTab(state, bot, csrf);
+  if (activeTab === "guide") return guideTab(csrf);
+  return overviewTab(state, statuses, csrf);
+}
+
+function overviewTab(state, statuses, csrf) {
+  const senderCount = state.bots.reduce(function (sum, bot) { return sum + bot.senders.length; }, 0);
+  const ruleCount = state.bots.reduce(function (sum, bot) { return sum + bot.rules.length; }, 0);
+  const connectedCount = state.bots.filter(function (bot) {
+    return bot.ownerChatId && bot.connectionEnabled !== false;
+  }).length;
+  const cards = state.bots.map(function (bot) {
+    return botSummary(bot, statuses[bot.id] || {}, csrf);
+  }).join("");
+  return pageHeader("نمای کلی", "وضعیت همه بات‌ها و هشدارها", "/admin?tab=bot-new", "＋ افزودن بات")
+    + "<div class='status'>" + stat("بات‌ها", String(state.bots.length))
+    + stat("متصل", String(connectedCount)) + stat("فرستنده‌ها", String(senderCount))
+    + stat("هشدارها", String(ruleCount)) + "</div><div style='height:14px'></div>"
+    + (cards || emptyBots());
+}
+
+function botsTab(state, statuses, csrf) {
+  const cards = state.bots.map(function (bot) {
+    return botSummary(bot, statuses[bot.id] || {}, csrf);
+  }).join("");
+  return pageHeader("بات‌ها", "توکن و وب‌هوک هر بات مستقل است", "/admin?tab=bot-new", "＋ افزودن بات جدید")
+    + (cards || emptyBots());
+}
+
+function botSummary(bot, status, csrf) {
   const connected = Boolean(bot.ownerChatId && bot.connectionEnabled !== false);
-  const rules = bot.rules.map(function (rule) { return ruleEditor(bot, rule, csrf); }).join("");
+  const lastSender = status.lastSenderId
+    ? (status.lastSenderLabel ? status.lastSenderLabel + " — " : "") + status.lastSenderId
+    : "هنوز پیامی نرسیده";
   return "<section class='card bot'><div class='bothead'><div><h2>" + escapeHtml(bot.label) + "</h2>"
     + "<div class='hint'>@" + escapeHtml(bot.botUsername || "نامشخص") + "</div></div>"
     + "<span class='pill" + (bot.enabled ? "" : " off") + "'>" + (bot.enabled ? "فعال" : "غیرفعال") + "</span></div>"
     + "<div class='status'>"
     + stat("Chat Automation", connected ? "<span class='pill'>متصل</span>" : "<span class='pill off'>منتظر اتصال</span>", true)
-    + stat("شناسه مالک", escapeHtml(bot.ownerChatId || "ثبت نشده"), true)
-    + stat("آخرین فرستنده", escapeHtml(status.lastSenderId || "هنوز پیامی نرسیده"), true)
-    + stat("آخرین رویداد", escapeHtml(status.lastAction || "ثبت نشده"), true)
-    + "</div><div class='divider'></div><h3>تنظیمات بات</h3>"
-    + botForm(bot, csrf)
-    + "<div class='divider'></div><h3>قوانین عبارتی</h3>"
-    + (rules || "<div class='empty'>هنوز قانونی برای این بات تعریف نشده است.</div>")
-    + "<div class='rule'><h3>افزودن قانون جدید</h3>" + ruleEditor(bot, null, csrf) + "</div>"
-    + "<div class='divider'></div><div class='actions'>"
-    + actionForm("/admin/bot/test", bot.id, csrf, "پیام آزمایشی", "secondary")
-    + actionForm("/admin/bot/disable", bot.id, csrf, "غیرفعال‌کردن وب‌هوک", "danger")
-    + actionForm("/admin/bot/delete", bot.id, csrf, "حذف کامل بات", "danger")
+    + stat("فرستنده‌ها", String(bot.senders.length))
+    + stat("هشدارها", String(bot.rules.length))
+    + stat("آخرین فرستنده", escapeHtml(lastSender), true)
+    + "</div><div class='actions'>"
+    + "<a class='btn secondary' href='/admin?tab=bot-edit&bot=" + encodeURIComponent(bot.id) + "'>تنظیمات بات</a>"
+    + "<a class='btn secondary' href='/admin?tab=sender-new&bot=" + encodeURIComponent(bot.id) + "'>＋ افزودن فرستنده</a>"
+    + "<a class='btn' href='/admin?tab=rule-new&bot=" + encodeURIComponent(bot.id) + "'>＋ افزودن هشدار</a>"
     + "</div></section>";
+}
+
+function sendersTab(state, bot, csrf) {
+  if (!bot) return emptyBots();
+  const botPicker = botPickerTabs(state, bot, "senders");
+  const senders = bot.senders.map(function (sender) {
+    return "<section class='card'>" + senderForm(bot, sender, csrf)
+      + "<form method='post' action='/admin/sender/delete' class='actions'>" + csrf
+      + hidden("bot_id", bot.id) + hidden("sender_id", sender.id)
+      + "<button class='danger' type='submit'>حذف فرستنده و قوانین مرتبط</button></form></section>";
+  }).join("");
+  return pageHeader("فرستنده‌های " + bot.label, "برای هر شخص یک نام و شناسه عددی ثبت کن",
+    "/admin?tab=sender-new&bot=" + encodeURIComponent(bot.id), "＋ افزودن فرستنده")
+    + botPicker + (senders || "<section class='card empty'>هنوز فرستنده‌ای ثبت نشده است.</section>");
+}
+
+function rulesTab(state, bot, csrf) {
+  if (!bot) return emptyBots();
+  const botPicker = botPickerTabs(state, bot, "rules");
+  const rules = bot.rules.map(function (rule) {
+    return "<section class='card'>" + ruleEditor(bot, rule, csrf)
+      + "<form method='post' action='/admin/rule/delete' class='actions'>" + csrf
+      + hidden("bot_id", bot.id) + hidden("rule_id", rule.id)
+      + "<button class='danger' type='submit'>حذف هشدار</button></form></section>";
+  }).join("");
+  return pageHeader("هشدارهای " + bot.label, "هر پیام می‌تواند چند هشدار منطبق را هم‌زمان اجرا کند",
+    "/admin?tab=rule-new&bot=" + encodeURIComponent(bot.id), "＋ افزودن هشدار")
+    + botPicker + (rules || "<section class='card empty'>هنوز هشداری تعریف نشده است.</section>");
+}
+
+function botPickerTabs(state, selectedBot, tab) {
+  return "<div class='tabs'>" + state.bots.map(function (bot) {
+    return "<a class='tab" + (bot.id === selectedBot.id ? " active" : "") + "' href='/admin?tab=" + tab
+      + "&bot=" + encodeURIComponent(bot.id) + "'>" + escapeHtml(bot.label) + "</a>";
+  }).join("") + "</div>";
+}
+
+function guideTab(csrf) {
+  return pageHeader("راهنما", "ترتیب صحیح راه‌اندازی", "", "")
+    + "<section class='card'><ol class='hint'><li>از تب بات‌ها، بات جدید را اضافه کن.</li>"
+    + "<li>Secretary Mode همان بات را در BotFather فعال کن.</li>"
+    + "<li>بات را در Telegram → Settings → Chat Automation متصل کن.</li>"
+    + "<li>در تب فرستنده‌ها، شناسه عددی افراد را ثبت کن.</li>"
+    + "<li>در تب هشدارها، فرستنده و نوع فیلتر را انتخاب کن.</li>"
+    + "<li>حالت «هر پیام» با هر پیام آن فرستنده اجرا می‌شود؛ حالت «شامل عبارت» فقط با وجود عبارت در متن یا کپشن.</li>"
+    + "<li>اگر چند قانون منطبق باشند، همه پیام‌های هشدار مربوطه ارسال می‌شوند.</li></ol>"
+    + "<form method='post' action='/logout' class='actions'>" + csrf
+    + "<button class='secondary' type='submit'>خروج از پنل</button></form></section>";
+}
+
+function pageHeader(title, subtitle, actionUrl, actionLabel) {
+  return "<div class='pagehead'><div><h2>" + escapeHtml(title) + "</h2>"
+    + (subtitle ? "<p class='hint'>" + escapeHtml(subtitle) + "</p>" : "") + "</div>"
+    + (actionUrl ? "<a class='btn' href='" + actionUrl + "'>" + escapeHtml(actionLabel) + "</a>" : "") + "</div>";
+}
+
+function emptyBots() {
+  return "<section class='card empty'>هنوز باتی وجود ندارد. از دکمه «افزودن بات» شروع کن.</section>";
 }
 
 function botForm(bot, csrf) {
@@ -816,29 +1073,51 @@ function botForm(bot, csrf) {
     + "<div class='full check'><input id='enabled_" + escapeHtml(existing ? bot.id : "new")
     + "' name='enabled' type='checkbox' " + (!existing || bot.enabled ? "checked" : "") + ">"
     + "<label for='enabled_" + escapeHtml(existing ? bot.id : "new") + "'>بات فعال باشد</label></div></div>"
-    + "<div class='actions'><button type='submit'>" + (existing ? "ذخیره بات و وب‌هوک" : "افزودن بات") + "</button></div></form>";
+    + "<div class='actions'><button type='submit'>" + (existing ? "ذخیره و فعال‌سازی وب‌هوک" : "افزودن بات") + "</button></div></form>";
+}
+
+function senderForm(bot, sender, csrf) {
+  const existing = Boolean(sender);
+  const idSuffix = existing ? sender.id : "new_" + bot.id;
+  return "<form method='post' action='/admin/sender/save'>" + csrf + hidden("bot_id", bot.id)
+    + (existing ? hidden("sender_id", sender.id) : "")
+    + "<div class='grid'><div><label>نام فرستنده</label><input name='label' maxlength='80' required value='"
+    + escapeHtml(existing ? sender.label : "") + "' placeholder='مثلاً سرور مانیتورینگ'></div>"
+    + "<div><label>شناسه عددی تلگرام</label><input name='telegram_id' inputmode='numeric' required value='"
+    + escapeHtml(existing ? sender.telegramId : "") + "' placeholder='123456789'></div>"
+    + "<div class='full check'><input id='sender_enabled_" + escapeHtml(idSuffix)
+    + "' name='enabled' type='checkbox' " + (!existing || sender.enabled ? "checked" : "") + ">"
+    + "<label for='sender_enabled_" + escapeHtml(idSuffix) + "'>این فرستنده فعال باشد</label></div></div>"
+    + "<div class='actions'><button type='submit'>" + (existing ? "ذخیره فرستنده" : "افزودن فرستنده") + "</button></div></form>";
 }
 
 function ruleEditor(bot, rule, csrf) {
   const existing = Boolean(rule);
   const idSuffix = existing ? rule.id : "new_" + bot.id;
-  const form = "<form method='post' action='/admin/rule/save'>" + csrf + hidden("bot_id", bot.id)
+  const senderRef = existing ? rule.senderRef : "*";
+  const matchType = existing ? rule.matchType : "any";
+  const senderOptions = "<option value='*'" + (senderRef === "*" ? " selected" : "") + ">همه فرستنده‌ها</option>"
+    + bot.senders.map(function (sender) {
+      return "<option value='" + escapeHtml(sender.id) + "'" + (senderRef === sender.id ? " selected" : "") + ">"
+        + escapeHtml(sender.label + " — " + sender.telegramId) + "</option>";
+    }).join("");
+  return "<form method='post' action='/admin/rule/save'>" + csrf + hidden("bot_id", bot.id)
     + (existing ? hidden("rule_id", rule.id) : "")
-    + "<div class='grid'><div><label>عبارت تریگر</label><input name='keyword' maxlength='200' required value='"
-    + escapeHtml(existing ? rule.keyword : "") + "' placeholder='مثلاً سایت قطع شد'></div>"
+    + "<div class='grid'><div><label>فرستنده</label><select name='sender_ref'>" + senderOptions + "</select></div>"
+    + "<div><label>نوع فیلتر پیام</label><select name='match_type'>"
+    + "<option value='any'" + (matchType === "any" ? " selected" : "") + ">هر پیام</option>"
+    + "<option value='contains'" + (matchType === "contains" ? " selected" : "") + ">شامل عبارت</option></select></div>"
+    + "<div><label>عبارت موردنظر</label><input name='keyword' maxlength='200' value='"
+    + escapeHtml(existing ? rule.keyword : "") + "' placeholder='فقط برای حالت شامل عبارت'>"
+    + "<p class='hint'>در حالت «هر پیام» این فیلد نادیده گرفته می‌شود.</p></div>"
     + "<div><label>فاصله تکرار (ثانیه)</label><input name='cooldown_seconds' type='number' min='0' max='86400' value='"
     + escapeHtml(String(existing ? rule.cooldownSeconds : 300)) + "'></div>"
-    + "<div class='full'><label>پیام هشدار</label><textarea name='alert_message' maxlength='4096' required>"
+    + "<div class='full'><label>متن هشدار ارسالی</label><textarea name='alert_message' maxlength='4096' required>"
     + escapeHtml(existing ? rule.alertMessage : "سایت قطع شد") + "</textarea></div>"
     + "<div class='full check'><input id='rule_enabled_" + escapeHtml(idSuffix) + "' name='enabled' type='checkbox' "
     + (!existing || rule.enabled ? "checked" : "") + "><label for='rule_enabled_" + escapeHtml(idSuffix)
-    + "'>این قانون فعال باشد</label></div></div><div class='actions'><button type='submit'>"
-    + (existing ? "ذخیره قانون" : "افزودن قانون") + "</button></div></form>";
-  if (!existing) return form;
-  return "<div class='rule'>" + form
-    + "<form method='post' action='/admin/rule/delete' class='actions'>" + csrf
-    + hidden("bot_id", bot.id) + hidden("rule_id", rule.id)
-    + "<button class='danger' type='submit'>حذف قانون</button></form></div>";
+    + "'>این هشدار فعال باشد</label></div></div><div class='actions'><button type='submit'>"
+    + (existing ? "ذخیره هشدار" : "افزودن هشدار") + "</button></div></form>";
 }
 
 function actionForm(action, botId, csrf, label, className) {
