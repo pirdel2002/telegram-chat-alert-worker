@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import worker from "../src/multi.js";
 
 class MemoryKV {
@@ -27,8 +28,40 @@ class MemoryKV {
   }
 }
 
+class TestD1Statement {
+  constructor(database, sql, values) {
+    this.database = database;
+    this.sql = sql;
+    this.values = values || [];
+  }
+  bind(...values) { return new TestD1Statement(this.database, this.sql, values); }
+  async run() {
+    const statement = this.database.prepare(this.sql);
+    if (/\bRETURNING\b/i.test(this.sql)) {
+      const results = statement.all(...this.values);
+      return { success: true, results: results, meta: { changes: results.length } };
+    }
+    const result = statement.run(...this.values);
+    return { success: true, results: [], meta: { changes: Number(result.changes) } };
+  }
+  async first() {
+    return this.database.prepare(this.sql).get(...this.values) || null;
+  }
+  async all() {
+    return { success: true, results: this.database.prepare(this.sql).all(...this.values), meta: {} };
+  }
+}
+
+class TestD1 {
+  constructor() { this.database = new DatabaseSync(":memory:"); }
+  async exec(sql) { this.database.exec(sql); return { count: 1, duration: 0 }; }
+  prepare(sql) { return new TestD1Statement(this.database, sql); }
+  async batch(statements) { return Promise.all(statements.map(function (statement) { return statement.run(); })); }
+}
+
 const env = {
   CONFIG_STORE: new MemoryKV(),
+  MESSAGE_DB: new TestD1(),
   ADMIN_PASSWORD: "correct horse battery staple",
 };
 
@@ -79,6 +112,7 @@ async function webhook(bot, payload, secret) {
 try {
   const migrationEnv = {
     CONFIG_STORE: new MemoryKV(),
+    MESSAGE_DB: new TestD1(),
     ADMIN_PASSWORD: env.ADMIN_PASSWORD,
   };
   await migrationEnv.CONFIG_STORE.put("telegram-alert:config:v1", JSON.stringify({
@@ -93,7 +127,7 @@ try {
   const migrationHealth = await worker.fetch(new Request("https://worker.example/health"), migrationEnv, ctx);
   assert.deepEqual(await migrationHealth.json(), { ok: true, bots: 1, enabledBots: 1, senders: 0, rules: 0 });
 
-  const v2Env = { CONFIG_STORE: new MemoryKV(), ADMIN_PASSWORD: env.ADMIN_PASSWORD };
+  const v2Env = { CONFIG_STORE: new MemoryKV(), MESSAGE_DB: new TestD1(), ADMIN_PASSWORD: env.ADMIN_PASSWORD };
   await v2Env.CONFIG_STORE.put("telegram-alert:state:v2", JSON.stringify({
     version: 2,
     bots: [{
@@ -276,13 +310,30 @@ try {
   assert.equal(connectionTwo.status, 200);
 
   state = await env.CONFIG_STORE.get("telegram-alert:state:v3", "json");
-  const readyFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
+  let readyFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
   const readySecond = state.bots.find(function (bot) { return bot.id === secondBot.id; });
+  assert.equal(readyFirst.connections.length, 1);
+  assert.equal(readySecond.connections.length, 1);
+
+  const connectionOneOtherSide = await webhook(readyFirst, {
+    update_id: 21,
+    business_connection: {
+      id: "business-one-other-side",
+      user: { id: 12345, first_name: "سامانه", last_name: "مانیتورینگ" },
+      user_chat_id: 12345,
+      is_enabled: true,
+    },
+  });
+  assert.equal(connectionOneOtherSide.status, 200);
+  state = await env.CONFIG_STORE.get("telegram-alert:state:v3", "json");
+  readyFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
+  assert.equal(readyFirst.connections.length, 2);
 
   const firstAlert = await webhook(readyFirst, {
     update_id: 3,
     business_message: {
       message_id: 10,
+      business_connection_id: "business-one",
       date: 1780000010,
       from: { id: 12345, first_name: "سامانه", last_name: "مانیتورینگ" },
       chat: { id: 12345, type: "private", first_name: "سامانه", last_name: "مانیتورینگ" },
@@ -300,9 +351,26 @@ try {
   assert.ok(firstSends.every(function (call) { return String(call.body.chat_id) === "555"; }));
 
   await webhook(readyFirst, {
+    update_id: 22,
+    business_message: {
+      message_id: 110,
+      business_connection_id: "business-one-other-side",
+      date: 1780000010,
+      from: { id: 12345, first_name: "سامانه", last_name: "مانیتورینگ" },
+      chat: { id: 555, type: "private", first_name: "محمد" },
+      text: "Monitoring: SERVICE DOWN",
+    },
+  });
+  await drainWaiters();
+  assert.equal(telegramCalls.filter(function (call) {
+    return call.method === "sendMessage" && call.token === "999:ONE";
+  }).length, 2);
+
+  await webhook(readyFirst, {
     update_id: 4,
     business_message: {
       message_id: 11,
+      business_connection_id: "business-one",
       date: 1780000020,
       from: { id: 12345, first_name: "سامانه", last_name: "مانیتورینگ" },
       chat: { id: 12345, type: "private", first_name: "سامانه", last_name: "مانیتورینگ" },
@@ -318,6 +386,7 @@ try {
     update_id: 41,
     business_message: {
       message_id: 14,
+      business_connection_id: "business-one",
       date: 1780000030,
       from: { id: 54321, first_name: "پشتیبان" },
       chat: { id: 54321, type: "private", first_name: "پشتیبان" },
@@ -333,6 +402,7 @@ try {
     update_id: 5,
     business_message: {
       message_id: 12,
+      business_connection_id: "business-two",
       date: 1780000040,
       from: { id: 98765, first_name: "علی", last_name: "احمدی" },
       chat: { id: 98765, type: "private", first_name: "علی", last_name: "احمدی" },
@@ -352,6 +422,7 @@ try {
     update_id: 6,
     business_message: {
       message_id: 13,
+      business_connection_id: "business-two",
       date: 1780000050,
       from: { id: 98765, first_name: "علی", last_name: "احمدی" },
       chat: { id: 98765, type: "private", first_name: "علی", last_name: "احمدی" },
@@ -365,6 +436,7 @@ try {
     update_id: 7,
     business_message: {
       message_id: 15,
+      business_connection_id: "business-one",
       date: 1780000060,
       from: { id: 555, first_name: "محمد" },
       chat: { id: 12345, type: "private", first_name: "سامانه", last_name: "مانیتورینگ" },
@@ -374,21 +446,23 @@ try {
   await drainWaiters();
   assert.equal(telegramCalls.filter(function (call) { return call.method === "sendMessage"; }).length, noMatchCount);
 
-  const historyKeysBeforeRetry = (await env.CONFIG_STORE.list({ prefix: "telegram-alert:message:v1:" })).keys;
-  assert.equal(historyKeysBeforeRetry.length, 6);
-  const encryptedHistoryValue = await env.CONFIG_STORE.get(historyKeysBeforeRetry[0].name);
-  assert.doesNotMatch(encryptedHistoryValue, /همه چیز عادی|Monitoring|پیام خروجی مالک/);
+  const historyCountBeforeRetry = await env.MESSAGE_DB.prepare("SELECT COUNT(*) AS count FROM messages").first();
+  assert.equal(Number(historyCountBeforeRetry.count), 7);
+  const encryptedHistory = await env.MESSAGE_DB.prepare("SELECT payload_cipher FROM messages LIMIT 1").first();
+  assert.doesNotMatch(encryptedHistory.payload_cipher, /همه چیز عادی|Monitoring|پیام خروجی مالک/);
   await webhook(readySecond, {
     update_id: 6,
     business_message: {
       message_id: 13,
+      business_connection_id: "business-two",
       date: 1780000050,
       from: { id: 98765, first_name: "علی", last_name: "احمدی" },
       chat: { id: 98765, type: "private", first_name: "علی", last_name: "احمدی" },
       text: "همه چیز عادی است",
     },
   });
-  assert.equal((await env.CONFIG_STORE.list({ prefix: "telegram-alert:message:v1:" })).keys.length, 6);
+  const historyCountAfterRetry = await env.MESSAGE_DB.prepare("SELECT COUNT(*) AS count FROM messages").first();
+  assert.equal(Number(historyCountAfterRetry.count), 7);
 
   const messagesPage = await worker.fetch(new Request("https://worker.example/admin?tab=messages", {
     headers: { cookie: cookie },
@@ -399,6 +473,38 @@ try {
   assert.match(messagesHtml, /مانیتور سایت/);
   assert.match(messagesHtml, /class='bubble incoming'/);
   assert.match(messagesHtml, /class='bubble outgoing'/);
+  assert.match(messagesHtml, /کنترل لاگ چت‌ها/);
+  assert.match(messagesHtml, /غیرفعال‌کردن لاگ این سمت/);
+  assert.match(messagesHtml, /دو سمت این گفتگو شناسایی شده/);
+
+  const secondSource = await env.MESSAGE_DB.prepare(
+    "SELECT source_key FROM chat_sources WHERE bot_id = ? AND chat_id = ?",
+  ).bind(readySecond.id, "98765").first();
+  assert.ok(secondSource);
+  const disableLog = await post("/admin/chat-log/toggle", cookie, csrf, {
+    source_key: secondSource.source_key,
+  });
+  assert.equal(disableLog.status, 303);
+  const countBeforeDisabledMessage = Number((await env.MESSAGE_DB.prepare("SELECT COUNT(*) AS count FROM messages").first()).count);
+  await webhook(readySecond, {
+    update_id: 8,
+    business_message: {
+      message_id: 16,
+      business_connection_id: "business-two",
+      date: 1780000070,
+      from: { id: 98765, first_name: "علی", last_name: "احمدی" },
+      chat: { id: 98765, type: "private", first_name: "علی", last_name: "احمدی" },
+      text: "خطای شبکه دوباره رخ داد",
+    },
+  });
+  await drainWaiters();
+  assert.equal(
+    Number((await env.MESSAGE_DB.prepare("SELECT COUNT(*) AS count FROM messages").first()).count),
+    countBeforeDisabledMessage,
+  );
+  assert.equal(telegramCalls.filter(function (call) {
+    return call.method === "sendMessage" && call.token === "888:TWO";
+  }).length, 2);
 
   const overviewAfterMessages = await worker.fetch(new Request("https://worker.example/admin", {
     headers: { cookie: cookie },
