@@ -1,12 +1,15 @@
 {
   "name": "telegram-chat-alert-worker",
-  "version": "3.1.0",
+  "version": "4.0.0",
   "private": true,
   "type": "module",
   "cloudflare": {
     "bindings": {
       "CONFIG_STORE": {
         "description": "فضای ذخیره تنظیمات پنل؛ هنگام نصب به‌صورت خودکار ساخته می‌شود."
+      },
+      "MESSAGE_DB": {
+        "description": "دیتابیس D1 برای تاریخچه پیام‌ها و تنظیم روشن یا خاموش بودن لاگ هر سمت چت."
       },
       "ADMIN_PASSWORD": {
         "description": "یک رمز قوی و منحصربه‌فرد برای ورود به پنل انتخاب کنید. توکن ربات را اینجا وارد نکنید."
@@ -17,7 +20,7 @@
     "check": "node --check src/multi.js",
     "test": "node test/multi.test.mjs",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler d1 migrations apply telegram-chat-alert-messages --remote && wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4.34.0"
