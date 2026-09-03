@@ -2,6 +2,10 @@ const STATE_KEY = "telegram-alert:state:v3";
 const V2_STATE_KEY = "telegram-alert:state:v2";
 const LEGACY_CONFIG_KEY = "telegram-alert:config:v1";
 const STATUS_PREFIX = "telegram-alert:status:v2:";
+const MESSAGE_PREFIX = "telegram-alert:message:v1:";
+const LAST_MESSAGE_PREFIX = "telegram-alert:last-message:v1:";
+const MESSAGE_PAGE_SIZE = 50;
+const DISPLAY_TIME_ZONE = "Asia/Tehran";
 const SESSION_SECONDS = 12 * 60 * 60;
 const LOGIN_WINDOW_SECONDS = 10 * 60;
 const MAX_LOGIN_ATTEMPTS = 5;
@@ -96,7 +100,11 @@ async function renderAdmin(request, env) {
   const url = new URL(request.url);
   const statuses = {};
   await Promise.all(state.bots.map(async function (bot) {
-    statuses[bot.id] = (await env.CONFIG_STORE.get(statusKey(bot.id), "json")) || {};
+    const values = await Promise.all([
+      env.CONFIG_STORE.get(statusKey(bot.id), "json"),
+      loadLastMessage(env, bot.id),
+    ]);
+    statuses[bot.id] = Object.assign({}, values[0] || {}, values[1] || {});
   }));
   const noticeCode = url.searchParams.get("notice") || "";
   const notices = {
@@ -110,11 +118,15 @@ async function renderAdmin(request, env) {
     "rule-deleted": "قانون حذف شد.",
   };
   const csrfToken = await csrfTokenForRequest(request, env);
-  const allowedTabs = ["overview", "bots", "bot-new", "bot-edit", "senders", "sender-new", "rules", "rule-new", "guide"];
+  const allowedTabs = ["overview", "messages", "bots", "bot-new", "bot-edit", "senders", "sender-new", "rules", "rule-new", "guide"];
   const requestedTab = url.searchParams.get("tab") || "overview";
   const activeTab = allowedTabs.includes(requestedTab) ? requestedTab : "overview";
   const selectedBotId = url.searchParams.get("bot") || "";
-  return html(adminPage(state, statuses, notices[noticeCode] || "", csrfToken, activeTab, selectedBotId));
+  const cursor = String(url.searchParams.get("cursor") || "");
+  const messagePage = activeTab === "messages"
+    ? await loadMessagePage(env, cursor.length <= 2048 ? cursor : "")
+    : { items: [], nextCursor: "" };
+  return html(adminPage(state, statuses, notices[noticeCode] || "", csrfToken, activeTab, selectedBotId, messagePage));
 }
 
 async function saveBot(request, env) {
@@ -399,13 +411,24 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   }
 
   const message = update.business_message;
-  if (!message || !bot.enabled) return new Response("OK");
+  if (!message) return new Response("OK");
   const senderId = String((message.from && message.from.id) || "");
   const incomingText = String(message.text || message.caption || "");
   const normalizedIncoming = normalizeText(incomingText);
   const configuredSender = bot.senders.find(function (sender) {
     return sender.enabled && sender.telegramId === senderId;
   });
+  const direction = bot.ownerChatId && senderId === String(bot.ownerChatId) ? "outgoing" : "incoming";
+  const messageRecord = buildMessageRecord(bot, message, update.update_id, configuredSender, direction);
+  await Promise.all([
+    saveMessage(env, messageRecord),
+    saveStatus(env, bot.id, {
+      lastSenderId: senderId,
+      lastSenderLabel: configuredSender ? configuredSender.label : "",
+    }),
+  ]);
+
+  if (!bot.enabled || direction === "outgoing") return new Response("OK");
   const matchedRules = bot.rules.filter(function (rule) {
     if (!rule.enabled) return false;
     if (rule.senderRef !== "*") {
@@ -578,6 +601,105 @@ async function saveStatus(env, botId, patch) {
   const key = statusKey(botId);
   const current = (await env.CONFIG_STORE.get(key, "json")) || {};
   await env.CONFIG_STORE.put(key, JSON.stringify(Object.assign({}, current, patch)));
+}
+
+function buildMessageRecord(bot, message, updateId, configuredSender, direction) {
+  const timestamp = Number(message.date) > 0 ? Number(message.date) : Math.floor(Date.now() / 1000);
+  const senderName = configuredSender
+    ? configuredSender.label
+    : telegramDisplayName(message.from, direction === "outgoing" ? "مالک حساب" : "فرستنده ناشناس");
+  const chatName = telegramDisplayName(message.chat, senderName);
+  const uniqueId = String(updateId == null ? (message.message_id || randomToken(6)) : updateId)
+    .replace(/[^A-Za-z0-9_-]/g, "_");
+  return {
+    key: messageKey(timestamp, bot.id, uniqueId),
+    botId: bot.id,
+    botLabel: bot.label,
+    senderName: senderName,
+    chatName: chatName,
+    direction: direction,
+    text: telegramMessageText(message),
+    timestamp: timestamp,
+    messageId: String(message.message_id || ""),
+  };
+}
+
+async function saveMessage(env, record) {
+  const stored = Object.assign({}, record);
+  delete stored.key;
+  const cipher = await encryptSecret(JSON.stringify(stored), encryptionSecret(env));
+  await Promise.all([
+    env.CONFIG_STORE.put(record.key, cipher),
+    env.CONFIG_STORE.put(LAST_MESSAGE_PREFIX + record.botId, cipher),
+  ]);
+}
+
+async function loadMessagePage(env, cursor) {
+  const options = { prefix: MESSAGE_PREFIX, limit: MESSAGE_PAGE_SIZE };
+  if (cursor) options.cursor = cursor;
+  const result = await env.CONFIG_STORE.list(options);
+  const items = (await Promise.all(result.keys.map(async function (item) {
+    const cipher = await env.CONFIG_STORE.get(item.name);
+    if (!cipher) return null;
+    try {
+      return JSON.parse(await decryptSecret(cipher, encryptionSecret(env)));
+    } catch (error) {
+      console.warn("Could not decrypt stored message", item.name, error);
+      return null;
+    }
+  }))).filter(Boolean);
+  return {
+    items: items,
+    nextCursor: result.list_complete ? "" : String(result.cursor || ""),
+  };
+}
+
+async function loadLastMessage(env, botId) {
+  const cipher = await env.CONFIG_STORE.get(LAST_MESSAGE_PREFIX + botId);
+  if (!cipher) return null;
+  try {
+    const message = JSON.parse(await decryptSecret(cipher, encryptionSecret(env)));
+    return {
+      lastMessageText: message.text,
+      lastMessageSenderName: message.senderName,
+      lastMessageAt: message.timestamp,
+      lastMessageDirection: message.direction,
+    };
+  } catch (error) {
+    console.warn("Could not decrypt last message", botId, error);
+    return null;
+  }
+}
+
+function messageKey(timestamp, botId, uniqueId) {
+  const milliseconds = Math.max(0, Math.floor(Number(timestamp) * 1000));
+  const reverseTime = String(9999999999999 - milliseconds).padStart(13, "0");
+  return MESSAGE_PREFIX + reverseTime + ":" + botId + ":" + uniqueId;
+}
+
+function telegramDisplayName(entity, fallback) {
+  if (!entity) return fallback || "ناشناس";
+  const fullName = [entity.first_name, entity.last_name].filter(Boolean).join(" ").trim();
+  if (fullName) return fullName;
+  if (entity.title) return String(entity.title);
+  if (entity.username) return "@" + String(entity.username);
+  return fallback || "ناشناس";
+}
+
+function telegramMessageText(message) {
+  const text = String(message.text || message.caption || "").trim();
+  if (text) return text;
+  if (message.photo) return "📷 تصویر";
+  if (message.video) return "🎬 ویدئو";
+  if (message.animation) return "🎞 تصویر متحرک";
+  if (message.voice) return "🎙 پیام صوتی";
+  if (message.audio) return "🎵 فایل صوتی";
+  if (message.document) return "📎 " + String(message.document.file_name || "فایل");
+  if (message.sticker) return (message.sticker.emoji ? message.sticker.emoji + " " : "") + "استیکر";
+  if (message.contact) return "👤 مخاطب";
+  if (message.location) return "📍 موقعیت مکانی";
+  if (message.poll) return "📊 نظرسنجی: " + String(message.poll.question || "");
+  return "پیام غیرمتنی";
 }
 
 function requireBot(state, value) {
@@ -860,6 +982,7 @@ function layout(title, content) {
     ".hint{color:var(--muted);font-size:12px;line-height:1.8;margin:6px 0 0}.check{display:flex;gap:9px;align-items:center}.check input{width:auto;accent-color:var(--accent)}button{border:0;border-radius:12px;padding:11px 15px;background:var(--accent);color:white;font:inherit;font-weight:bold;cursor:pointer}.secondary{background:#213752}.danger{background:#6b2533}",
     ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}.actions form{margin:0}.status{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.stat{background:#091626;border:1px solid var(--line);padding:11px;border-radius:12px}.stat b{display:block;margin-top:5px;font-size:13px;word-break:break-word}.muted{color:var(--muted)}",
     ".notice{padding:13px 15px;border-radius:12px;margin-bottom:16px;background:#123b33;border:1px solid #1b6a58}.pill{display:inline-flex;padding:4px 9px;border-radius:999px;background:#174438;color:#8ef0d2;font-size:12px}.pill.off{background:#46232e;color:#ffb1bf}.divider{height:1px;background:var(--line);margin:18px 0}.rule{background:#0a1728;border:1px solid var(--line);border-radius:15px;padding:14px;margin-top:12px}",
+    ".chat-card{padding:12px}.chat-stream{display:flex;flex-direction:column;gap:9px;background:#071321;border-radius:15px;padding:16px;min-height:220px}.bubble{width:fit-content;max-width:min(76%,680px);border:1px solid var(--line);border-radius:16px;padding:10px 12px;box-shadow:0 8px 20px #0003}.bubble.incoming{margin-right:auto;background:#12243a;border-bottom-left-radius:4px}.bubble.outgoing{margin-left:auto;background:#164537;border-color:#256653;border-bottom-right-radius:4px}.bubble-head{display:flex;gap:8px;align-items:center;justify-content:space-between;color:#8fc8ff;font-size:12px;margin-bottom:6px}.bubble.outgoing .bubble-head{color:#8ef0d2}.bubble-text{white-space:normal;overflow-wrap:anywhere;line-height:1.8}.bubble-meta{display:flex;gap:8px;justify-content:flex-end;color:var(--muted);font-size:10px;margin-top:6px}.day{align-self:center;background:#1c3149;color:#cfe3f8;border-radius:999px;padding:5px 11px;font-size:11px;margin:8px 0}.last-message{display:block;line-height:1.7}.last-message small{display:block;color:var(--muted);font-weight:normal}.pager{display:flex;justify-content:center;margin:14px 0}.privacy-note{margin-bottom:12px;padding:10px 12px;border-radius:12px;background:#302912;color:#f7d98c;font-size:12px}",
     ".login{width:min(430px,calc(100% - 28px));margin:14vh auto}.login button{width:100%;margin-top:14px}.foot{color:var(--muted);text-align:center;font-size:11px;margin-top:16px}.empty{padding:15px;border:1px dashed var(--line);border-radius:12px;color:var(--muted)}",
     "@media(max-width:760px){.shell{display:block}.sidebar{position:static;margin-bottom:12px;padding:9px}.nav{flex-direction:row;overflow-x:auto}.nav a{white-space:nowrap}.botlinks,.side-title{display:none}.grid,.status{grid-template-columns:1fr}.full{grid-column:auto}.wrap{margin-top:12px}.card{padding:16px}.bothead,.pagehead{display:block}.bothead .pill,.pagehead .btn{margin-top:9px}.actions button,.actions .btn{width:100%}.actions form{flex:1 1 100%}}",
   ].join("");
@@ -880,7 +1003,7 @@ function loginPage(error) {
     + "<p class='foot'>توکن بات‌ها به‌صورت رمزنگاری‌شده نگهداری می‌شود.</p></main>");
 }
 
-function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId) {
+function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId, messagePage) {
   const csrf = csrfInput(csrfToken);
   const selectedBot = state.bots.find(function (bot) { return bot.id === selectedBotId; })
     || state.bots[0] || null;
@@ -890,6 +1013,7 @@ function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId)
     : activeTab;
   const tabs = [
     ["overview", "نمای کلی"],
+    ["messages", "پیام‌ها"],
     ["bots", "بات‌ها"],
     ["senders", "فرستنده‌ها"],
     ["rules", "هشدارها"],
@@ -905,6 +1029,7 @@ function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId)
   }).join("");
   const sidebar = "<aside class='sidebar'><div class='side-title'>دسترسی سریع</div><nav class='nav'>"
     + sideLink("overview", "⌂ نمای کلی", section)
+    + sideLink("messages", "💬 پیام‌ها", section)
     + sideLink("bots", "🤖 مدیریت بات‌ها", section)
     + sideLink("senders", "👤 فرستنده‌ها", section, selectedBot)
     + sideLink("rules", "🔔 هشدارها", section, selectedBot)
@@ -913,7 +1038,7 @@ function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId)
     + (sidebarBots || "<div class='hint'>هنوز باتی نیست</div>") + "</div>"
     + "<form method='post' action='/logout' class='actions'>" + csrf
     + "<button class='secondary' type='submit'>خروج</button></form></aside>";
-  const content = renderTab(activeTab, state, selectedBot, statuses, csrf);
+  const content = renderTab(activeTab, state, selectedBot, statuses, csrf, messagePage);
   const page = "<main class='wrap'><div class='brand'><div class='logo'>🔔</div><div>"
     + "<h1>پنل هشدار تلگرام</h1><p>چند بات، چند فرستنده و چند فیلتر مستقل</p></div></div>"
     + "<div class='tabs'>" + tabs + "</div>"
@@ -928,7 +1053,7 @@ function sideLink(tab, label, activeSection, bot) {
     + label + "</a>";
 }
 
-function renderTab(activeTab, state, bot, statuses, csrf) {
+function renderTab(activeTab, state, bot, statuses, csrf, messagePage) {
   if (activeTab === "bot-new") {
     return pageHeader("افزودن بات جدید", "", "/admin?tab=bots", "بازگشت")
       + "<section class='card'>" + botForm(null, csrf) + "</section>";
@@ -954,6 +1079,7 @@ function renderTab(activeTab, state, bot, statuses, csrf) {
       + "<section class='card'>" + ruleEditor(bot, null, csrf) + "</section>";
   }
   if (activeTab === "bots") return botsTab(state, statuses, csrf);
+  if (activeTab === "messages") return messagesTab(messagePage);
   if (activeTab === "senders") return sendersTab(state, bot, csrf);
   if (activeTab === "rules") return rulesTab(state, bot, csrf);
   if (activeTab === "guide") return guideTab(csrf);
@@ -986,8 +1112,10 @@ function botsTab(state, statuses, csrf) {
 
 function botSummary(bot, status, csrf) {
   const connected = Boolean(bot.ownerChatId && bot.connectionEnabled !== false);
-  const lastSender = status.lastSenderId
-    ? (status.lastSenderLabel ? status.lastSenderLabel + " — " : "") + status.lastSenderId
+  const lastMessage = status.lastMessageAt
+    ? "<span class='last-message'>" + escapeHtml(status.lastMessageSenderName || "ناشناس")
+      + "<small>" + escapeHtml(shortText(status.lastMessageText || "پیام غیرمتنی", 80))
+      + " · " + escapeHtml(formatMessageTime(status.lastMessageAt)) + "</small></span>"
     : "هنوز پیامی نرسیده";
   return "<section class='card bot'><div class='bothead'><div><h2>" + escapeHtml(bot.label) + "</h2>"
     + "<div class='hint'>@" + escapeHtml(bot.botUsername || "نامشخص") + "</div></div>"
@@ -996,12 +1124,38 @@ function botSummary(bot, status, csrf) {
     + stat("Chat Automation", connected ? "<span class='pill'>متصل</span>" : "<span class='pill off'>منتظر اتصال</span>", true)
     + stat("فرستنده‌ها", String(bot.senders.length))
     + stat("هشدارها", String(bot.rules.length))
-    + stat("آخرین فرستنده", escapeHtml(lastSender), true)
+    + stat("آخرین پیام", lastMessage, true)
     + "</div><div class='actions'>"
     + "<a class='btn secondary' href='/admin?tab=bot-edit&bot=" + encodeURIComponent(bot.id) + "'>تنظیمات بات</a>"
     + "<a class='btn secondary' href='/admin?tab=sender-new&bot=" + encodeURIComponent(bot.id) + "'>＋ افزودن فرستنده</a>"
     + "<a class='btn' href='/admin?tab=rule-new&bot=" + encodeURIComponent(bot.id) + "'>＋ افزودن هشدار</a>"
     + "</div></section>";
+}
+
+function messagesTab(messagePage) {
+  const chronological = (messagePage.items || []).slice().reverse();
+  let previousDay = "";
+  const messages = chronological.map(function (message) {
+    const dayKey = formatMessageDay(message.timestamp);
+    const separator = dayKey !== previousDay ? "<div class='day'>" + escapeHtml(dayKey) + "</div>" : "";
+    previousDay = dayKey;
+    const direction = message.direction === "outgoing" ? "outgoing" : "incoming";
+    const directionLabel = direction === "outgoing" ? "خروجی" : "ورودی";
+    const safeText = escapeHtml(message.text || "پیام غیرمتنی").replace(/\r?\n/g, "<br>");
+    return separator + "<article class='bubble " + direction + "'><div class='bubble-head'><strong>"
+      + escapeHtml(message.senderName || "ناشناس") + "</strong><span>" + escapeHtml(message.botLabel || "بات")
+      + "</span></div><div class='bubble-text'>" + safeText + "</div><div class='bubble-meta'><span>"
+      + directionLabel + "</span><time>" + escapeHtml(formatMessageTime(message.timestamp)) + "</time></div></article>";
+  }).join("");
+  const older = messagePage.nextCursor
+    ? "<div class='pager'><a class='btn secondary' href='/admin?tab=messages&cursor="
+      + encodeURIComponent(messagePage.nextCursor) + "'>نمایش ۵۰ پیام قدیمی‌تر</a></div>"
+    : "";
+  return pageHeader("پیام‌ها", "پیام‌های خوانده‌شده توسط همه بات‌ها، از قدیمی به جدید در هر صفحه", "", "")
+    + "<div class='privacy-note'>تاریخچه بدون حذف خودکار در KV ذخیره می‌شود. برای حجم بالای پیام، انتقال به D1 لازم خواهد شد.</div>"
+    + (messages
+      ? "<section class='card chat-card'><div class='chat-stream'>" + messages + "</div></section>" + older
+      : "<section class='card empty'>هنوز پیامی توسط بات‌ها خوانده نشده است.</section>");
 }
 
 function sendersTab(state, bot, csrf) {
@@ -1142,6 +1296,30 @@ function messagePage(title, message) {
   return layout(title, "<main class='login'><div class='brand'><div class='logo'>⚠️</div><div><h1>"
     + escapeHtml(title) + "</h1></div></div><section class='card'><p>" + escapeHtml(message)
     + "</p><a href='/admin' style='color:#67b8ff'>بازگشت به پنل</a></section></main>");
+}
+
+function shortText(value, limit) {
+  const clean = String(value || "").replace(/\s+/g, " ").trim();
+  return clean.length > limit ? clean.slice(0, limit - 1) + "…" : clean;
+}
+
+function formatMessageTime(timestamp) {
+  return new Intl.DateTimeFormat("fa-IR", {
+    timeZone: DISPLAY_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date(Number(timestamp) * 1000));
+}
+
+function formatMessageDay(timestamp) {
+  return new Intl.DateTimeFormat("fa-IR", {
+    timeZone: DISPLAY_TIME_ZONE,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  }).format(new Date(Number(timestamp) * 1000));
 }
 
 function escapeHtml(value) {
