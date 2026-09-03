@@ -10,6 +10,21 @@ class MemoryKV {
   }
   async put(key, value) { this.data.set(key, String(value)); }
   async delete(key) { this.data.delete(key); }
+  async list(options) {
+    const prefix = String((options && options.prefix) || "");
+    const limit = Number((options && options.limit) || 1000);
+    const offset = Number(String((options && options.cursor) || "0").replace("cursor_", "")) || 0;
+    const names = Array.from(this.data.keys()).filter(function (key) {
+      return key.startsWith(prefix);
+    }).sort();
+    const page = names.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    return {
+      keys: page.map(function (name) { return { name: name }; }),
+      list_complete: nextOffset >= names.length,
+      cursor: nextOffset < names.length ? "cursor_" + nextOffset : "",
+    };
+  }
 }
 
 const env = {
@@ -268,8 +283,9 @@ try {
     update_id: 3,
     business_message: {
       message_id: 10,
-      from: { id: 12345 },
-      chat: { id: 12345, type: "private" },
+      date: 1780000010,
+      from: { id: 12345, first_name: "سامانه", last_name: "مانیتورینگ" },
+      chat: { id: 12345, type: "private", first_name: "سامانه", last_name: "مانیتورینگ" },
       text: "Monitoring: SERVICE DOWN",
     },
   });
@@ -287,8 +303,9 @@ try {
     update_id: 4,
     business_message: {
       message_id: 11,
-      from: { id: 12345 },
-      chat: { id: 12345, type: "private" },
+      date: 1780000020,
+      from: { id: 12345, first_name: "سامانه", last_name: "مانیتورینگ" },
+      chat: { id: 12345, type: "private", first_name: "سامانه", last_name: "مانیتورینگ" },
       text: "down",
     },
   });
@@ -301,8 +318,9 @@ try {
     update_id: 41,
     business_message: {
       message_id: 14,
-      from: { id: 54321 },
-      chat: { id: 54321, type: "private" },
+      date: 1780000030,
+      from: { id: 54321, first_name: "پشتیبان" },
+      chat: { id: 54321, type: "private", first_name: "پشتیبان" },
       text: "down",
     },
   });
@@ -315,8 +333,9 @@ try {
     update_id: 5,
     business_message: {
       message_id: 12,
-      from: { id: 98765 },
-      chat: { id: 98765, type: "private" },
+      date: 1780000040,
+      from: { id: 98765, first_name: "علی", last_name: "احمدی" },
+      chat: { id: 98765, type: "private", first_name: "علی", last_name: "احمدی" },
       caption: "خطای شبکه رخ داد",
     },
   });
@@ -333,13 +352,60 @@ try {
     update_id: 6,
     business_message: {
       message_id: 13,
-      from: { id: 98765 },
-      chat: { id: 98765, type: "private" },
+      date: 1780000050,
+      from: { id: 98765, first_name: "علی", last_name: "احمدی" },
+      chat: { id: 98765, type: "private", first_name: "علی", last_name: "احمدی" },
       text: "همه چیز عادی است",
     },
   });
   await drainWaiters();
   assert.equal(telegramCalls.filter(function (call) { return call.method === "sendMessage"; }).length, noMatchCount);
+
+  await webhook(readyFirst, {
+    update_id: 7,
+    business_message: {
+      message_id: 15,
+      date: 1780000060,
+      from: { id: 555, first_name: "محمد" },
+      chat: { id: 12345, type: "private", first_name: "سامانه", last_name: "مانیتورینگ" },
+      text: "پیام خروجی مالک",
+    },
+  });
+  await drainWaiters();
+  assert.equal(telegramCalls.filter(function (call) { return call.method === "sendMessage"; }).length, noMatchCount);
+
+  const historyKeysBeforeRetry = (await env.CONFIG_STORE.list({ prefix: "telegram-alert:message:v1:" })).keys;
+  assert.equal(historyKeysBeforeRetry.length, 6);
+  const encryptedHistoryValue = await env.CONFIG_STORE.get(historyKeysBeforeRetry[0].name);
+  assert.doesNotMatch(encryptedHistoryValue, /همه چیز عادی|Monitoring|پیام خروجی مالک/);
+  await webhook(readySecond, {
+    update_id: 6,
+    business_message: {
+      message_id: 13,
+      date: 1780000050,
+      from: { id: 98765, first_name: "علی", last_name: "احمدی" },
+      chat: { id: 98765, type: "private", first_name: "علی", last_name: "احمدی" },
+      text: "همه چیز عادی است",
+    },
+  });
+  assert.equal((await env.CONFIG_STORE.list({ prefix: "telegram-alert:message:v1:" })).keys.length, 6);
+
+  const messagesPage = await worker.fetch(new Request("https://worker.example/admin?tab=messages", {
+    headers: { cookie: cookie },
+  }), env, ctx);
+  const messagesHtml = await messagesPage.text();
+  assert.match(messagesHtml, /پیام خروجی مالک/);
+  assert.match(messagesHtml, /علی احمدی/);
+  assert.match(messagesHtml, /مانیتور سایت/);
+  assert.match(messagesHtml, /class='bubble incoming'/);
+  assert.match(messagesHtml, /class='bubble outgoing'/);
+
+  const overviewAfterMessages = await worker.fetch(new Request("https://worker.example/admin", {
+    headers: { cookie: cookie },
+  }), env, ctx);
+  const overviewAfterMessagesHtml = await overviewAfterMessages.text();
+  assert.match(overviewAfterMessagesHtml, /آخرین پیام/);
+  assert.match(overviewAfterMessagesHtml, /پیام خروجی مالک/);
 
   const forbidden = await webhook(readyFirst, {}, "wrong-secret");
   assert.equal(forbidden.status, 403);
