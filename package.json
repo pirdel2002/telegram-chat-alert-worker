@@ -1,6 +1,6 @@
 {
   "name": "telegram-chat-alert-worker",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "cloudflare": {
@@ -14,8 +14,8 @@
     }
   },
   "scripts": {
-    "check": "node --check src/index.js",
-    "test": "node test/worker.test.mjs",
+    "check": "node --check src/multi.js",
+    "test": "node test/multi.test.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
