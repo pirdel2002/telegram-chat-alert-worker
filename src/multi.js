@@ -5,6 +5,7 @@ const LEGACY_CONFIG_KEY = "telegram-alert:config:v1";
 const STATUS_PREFIX = "telegram-alert:status:v2:";
 const MESSAGE_PREFIX = "telegram-alert:message:v1:";
 const KV_HISTORY_MIGRATION_KEY = "telegram-alert:d1-migration:v1";
+const RUNTIME_MIGRATION_NAME = "runtime-state-from-kv-v1";
 const MESSAGE_PAGE_SIZES = [20, 50, 100];
 const DISPLAY_TIME_ZONE = "Asia/Tehran";
 const SESSION_SECONDS = 12 * 60 * 60;
@@ -102,12 +103,13 @@ async function handleLogin(request, env) {
 
 async function renderAdmin(request, env) {
   const state = await loadState(env);
+  await ensureRuntimeStateMigrated(env, state);
   await migrateKvHistoryToD1(env);
   const url = new URL(request.url);
   const statuses = {};
   await Promise.all(state.bots.map(async function (bot) {
     const values = await Promise.all([
-      env.CONFIG_STORE.get(statusKey(bot.id), "json"),
+      loadStatus(env, bot.id),
       loadLastMessageFromD1(env, bot.id, state.senders),
     ]);
     statuses[bot.id] = Object.assign({}, values[0] || {}, values[1] || {});
@@ -264,12 +266,11 @@ async function deleteBot(request, env) {
   await telegramApi(token, "deleteWebhook", { drop_pending_updates: false });
   state.bots = state.bots.filter(function (item) { return item.id !== bot.id; });
   await saveState(env, state);
-  await Promise.all([
-    env.CONFIG_STORE.delete(statusKey(bot.id)),
-    env.MESSAGE_DB.batch([
-      env.MESSAGE_DB.prepare("DELETE FROM messages WHERE bot_id = ?").bind(bot.id),
-      env.MESSAGE_DB.prepare("DELETE FROM chat_sources WHERE bot_id = ?").bind(bot.id),
-    ]),
+  await env.MESSAGE_DB.batch([
+    env.MESSAGE_DB.prepare("DELETE FROM messages WHERE bot_id = ?").bind(bot.id),
+    env.MESSAGE_DB.prepare("DELETE FROM chat_sources WHERE bot_id = ?").bind(bot.id),
+    env.MESSAGE_DB.prepare("DELETE FROM runtime_status WHERE bot_id = ?").bind(bot.id),
+    env.MESSAGE_DB.prepare("DELETE FROM rule_cooldowns WHERE bot_id = ?").bind(bot.id),
   ]);
   return redirect("/admin?tab=bots&notice=bot-deleted");
 }
@@ -322,9 +323,13 @@ async function deleteSender(request, env) {
   });
   state.senders = state.senders.filter(function (sender) { return sender.id !== senderId; });
   await saveState(env, state);
-  await Promise.all(removedRules.map(function (rule) {
-    return env.CONFIG_STORE.delete(cooldownKey(rule.botId, rule.ruleId));
-  }));
+  if (removedRules.length) {
+    await env.MESSAGE_DB.batch(removedRules.map(function (rule) {
+      return env.MESSAGE_DB.prepare(
+        "DELETE FROM rule_cooldowns WHERE bot_id = ? AND rule_id = ?",
+      ).bind(rule.botId, rule.ruleId);
+    }));
+  }
   return redirect("/admin?tab=senders&notice=sender-deleted");
 }
 
@@ -381,7 +386,7 @@ async function deleteRule(request, env) {
   bot.rules = bot.rules.filter(function (rule) { return rule.id !== ruleId; });
   bot.updatedAt = new Date().toISOString();
   await saveState(env, state);
-  await env.CONFIG_STORE.delete(cooldownKey(bot.id, ruleId));
+  await releaseCooldown(env, bot.id, ruleId);
   return redirect("/admin?tab=rules&bot=" + encodeURIComponent(bot.id) + "&notice=rule-deleted");
 }
 
@@ -420,6 +425,7 @@ async function deleteMessages(request, env) {
 async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   if (request.method !== "POST") return methodNotAllowed();
   const state = await loadState(env);
+  await ensureRuntimeStateMigrated(env, state);
   const suppliedSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
   let bot = requestedBotId
     ? state.bots.find(function (item) { return item.id === requestedBotId; })
@@ -538,12 +544,7 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
 
   const readyRules = [];
   for (const rule of matchedRules) {
-    const key = cooldownKey(bot.id, rule.id);
-    if (rule.cooldownSeconds > 0 && (await env.CONFIG_STORE.get(key))) continue;
-    if (rule.cooldownSeconds > 0) {
-      await env.CONFIG_STORE.put(key, "1", { expirationTtl: Math.max(60, rule.cooldownSeconds) });
-    }
-    readyRules.push(rule);
+    if (await acquireCooldown(env, bot.id, rule.id, rule.cooldownSeconds)) readyRules.push(rule);
   }
   if (!readyRules.length) {
     await saveStatus(env, bot.id, {
@@ -565,7 +566,7 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
       });
       return rule.id;
     } catch (error) {
-      if (rule.cooldownSeconds > 0) await env.CONFIG_STORE.delete(cooldownKey(bot.id, rule.id));
+      if (rule.cooldownSeconds > 0) await releaseCooldown(env, bot.id, rule.id);
       throw error;
     }
   })).then(async function (results) {
@@ -615,7 +616,23 @@ async function ensureMessageDatabase(env) {
       + "updated_at INTEGER NOT NULL"
       + ");"
       + "CREATE INDEX IF NOT EXISTS idx_chat_sources_updated ON chat_sources(updated_at DESC);"
-      + "CREATE INDEX IF NOT EXISTS idx_chat_sources_conversation ON chat_sources(conversation_key);",
+      + "CREATE INDEX IF NOT EXISTS idx_chat_sources_conversation ON chat_sources(conversation_key);"
+      + "CREATE TABLE IF NOT EXISTS runtime_status ("
+      + "bot_id TEXT PRIMARY KEY,"
+      + "payload_cipher TEXT NOT NULL,"
+      + "updated_at INTEGER NOT NULL"
+      + ");"
+      + "CREATE TABLE IF NOT EXISTS rule_cooldowns ("
+      + "bot_id TEXT NOT NULL,"
+      + "rule_id TEXT NOT NULL,"
+      + "expires_at INTEGER NOT NULL,"
+      + "PRIMARY KEY (bot_id, rule_id)"
+      + ");"
+      + "CREATE INDEX IF NOT EXISTS idx_rule_cooldowns_expiry ON rule_cooldowns(expires_at);"
+      + "CREATE TABLE IF NOT EXISTS app_migrations ("
+      + "name TEXT PRIMARY KEY,"
+      + "completed_at INTEGER NOT NULL"
+      + ");",
   );
   readyDatabases.add(env.MESSAGE_DB);
 }
@@ -789,9 +806,77 @@ async function saveState(env, state) {
 }
 
 async function saveStatus(env, botId, patch) {
-  const key = statusKey(botId);
-  const current = (await env.CONFIG_STORE.get(key, "json")) || {};
-  await env.CONFIG_STORE.put(key, JSON.stringify(Object.assign({}, current, patch)));
+  const current = (await loadStatus(env, botId)) || {};
+  const cipher = await encryptSecret(
+    JSON.stringify(Object.assign({}, current, patch)),
+    encryptionSecret(env),
+  );
+  await env.MESSAGE_DB.prepare(
+    "INSERT INTO runtime_status (bot_id, payload_cipher, updated_at) VALUES (?, ?, ?) "
+      + "ON CONFLICT(bot_id) DO UPDATE SET payload_cipher = excluded.payload_cipher, updated_at = excluded.updated_at",
+  ).bind(botId, cipher, Math.floor(Date.now() / 1000)).run();
+}
+
+async function loadStatus(env, botId) {
+  const row = await env.MESSAGE_DB.prepare(
+    "SELECT payload_cipher FROM runtime_status WHERE bot_id = ?",
+  ).bind(botId).first();
+  if (!row) return null;
+  try {
+    return JSON.parse(await decryptSecret(row.payload_cipher, encryptionSecret(env)));
+  } catch (error) {
+    console.warn("Could not decrypt runtime status", botId, error);
+    return null;
+  }
+}
+
+async function ensureRuntimeStateMigrated(env, state) {
+  const completed = await env.MESSAGE_DB.prepare(
+    "SELECT 1 AS done FROM app_migrations WHERE name = ?",
+  ).bind(RUNTIME_MIGRATION_NAME).first();
+  if (completed) return;
+  const statements = [];
+  const now = Math.floor(Date.now() / 1000);
+  for (const bot of state.bots) {
+    const oldStatus = await env.CONFIG_STORE.get(statusKey(bot.id), "json");
+    if (oldStatus) {
+      const cipher = await encryptSecret(JSON.stringify(oldStatus), encryptionSecret(env));
+      statements.push(env.MESSAGE_DB.prepare(
+        "INSERT INTO runtime_status (bot_id, payload_cipher, updated_at) VALUES (?, ?, ?) "
+          + "ON CONFLICT(bot_id) DO NOTHING",
+      ).bind(bot.id, cipher, now));
+    }
+    for (const rule of bot.rules) {
+      if (rule.cooldownSeconds <= 0) continue;
+      if (await env.CONFIG_STORE.get(cooldownKey(bot.id, rule.id))) {
+        statements.push(env.MESSAGE_DB.prepare(
+          "INSERT INTO rule_cooldowns (bot_id, rule_id, expires_at) VALUES (?, ?, ?) "
+            + "ON CONFLICT(bot_id, rule_id) DO NOTHING",
+        ).bind(bot.id, rule.id, now + rule.cooldownSeconds));
+      }
+    }
+  }
+  if (statements.length) await env.MESSAGE_DB.batch(statements);
+  await env.MESSAGE_DB.prepare(
+    "INSERT OR IGNORE INTO app_migrations (name, completed_at) VALUES (?, ?)",
+  ).bind(RUNTIME_MIGRATION_NAME, now).run();
+}
+
+async function acquireCooldown(env, botId, ruleId, cooldownSeconds) {
+  if (cooldownSeconds <= 0) return true;
+  const now = Math.floor(Date.now() / 1000);
+  const result = await env.MESSAGE_DB.prepare(
+    "INSERT INTO rule_cooldowns (bot_id, rule_id, expires_at) VALUES (?, ?, ?) "
+      + "ON CONFLICT(bot_id, rule_id) DO UPDATE SET expires_at = excluded.expires_at "
+      + "WHERE rule_cooldowns.expires_at <= ? RETURNING expires_at",
+  ).bind(botId, ruleId, now + cooldownSeconds, now).first();
+  return Boolean(result);
+}
+
+async function releaseCooldown(env, botId, ruleId) {
+  await env.MESSAGE_DB.prepare(
+    "DELETE FROM rule_cooldowns WHERE bot_id = ? AND rule_id = ?",
+  ).bind(botId, ruleId).run();
 }
 
 function buildMessageRecord(bot, message, updateId, configuredSender, direction, connection) {

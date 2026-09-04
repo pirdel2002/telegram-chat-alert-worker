@@ -3,15 +3,29 @@ import { DatabaseSync } from "node:sqlite";
 import worker from "../src/multi.js";
 
 class MemoryKV {
-  constructor() { this.data = new Map(); }
+  constructor() {
+    this.data = new Map();
+    this.readCount = 0;
+    this.writeCount = 0;
+    this.deleteCount = 0;
+    this.listCount = 0;
+  }
   async get(key, type) {
+    this.readCount += 1;
     const value = this.data.get(key);
     if (value == null) return null;
     return type === "json" ? JSON.parse(value) : value;
   }
-  async put(key, value) { this.data.set(key, String(value)); }
-  async delete(key) { this.data.delete(key); }
+  async put(key, value) {
+    this.writeCount += 1;
+    this.data.set(key, String(value));
+  }
+  async delete(key) {
+    this.deleteCount += 1;
+    this.data.delete(key);
+  }
   async list(options) {
+    this.listCount += 1;
     const prefix = String((options && options.prefix) || "");
     const limit = Number((options && options.limit) || 1000);
     const offset = Number(String((options && options.cursor) || "0").replace("cursor_", "")) || 0;
@@ -176,6 +190,28 @@ try {
   assert.equal(sharedMigration.senders.length, 1);
   assert.equal(sharedMigration.bots[0].rules[0].senderRef, sharedMigration.senders[0].id);
   assert.equal(sharedMigration.bots[1].rules[0].senderRef, sharedMigration.senders[0].id);
+
+  await v3Env.CONFIG_STORE.put("telegram-alert:status:v2:bot_oldone", JSON.stringify({
+    connection: "connected",
+    lastAction: "وضعیت قدیمی",
+  }));
+  await v3Env.CONFIG_STORE.put("telegram-alert:cooldown:v2:bot_oldone:rule_oldone", "1");
+  const v3Login = await worker.fetch(new Request("https://worker.example/login", {
+    method: "POST",
+    headers: { origin: "null" },
+    body: new URLSearchParams({ password: env.ADMIN_PASSWORD }),
+  }), v3Env, ctx);
+  const v3Cookie = v3Login.headers.get("set-cookie").split(";")[0];
+  const v3Admin = await worker.fetch(new Request("https://worker.example/admin", {
+    headers: { cookie: v3Cookie },
+  }), v3Env, ctx);
+  assert.equal(v3Admin.status, 200);
+  assert.ok(await v3Env.MESSAGE_DB.prepare(
+    "SELECT payload_cipher FROM runtime_status WHERE bot_id = ?",
+  ).bind("bot_oldone").first());
+  assert.ok(await v3Env.MESSAGE_DB.prepare(
+    "SELECT expires_at FROM rule_cooldowns WHERE bot_id = ? AND rule_id = ?",
+  ).bind("bot_oldone", "rule_oldone").first());
 
   const loginResponse = await worker.fetch(new Request("https://worker.example/login", {
     method: "POST",
@@ -362,6 +398,9 @@ try {
   readyFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
   assert.equal(readyFirst.connections.length, 2);
 
+  const kvWritesBeforeMessages = env.CONFIG_STORE.writeCount;
+  const kvDeletesBeforeMessages = env.CONFIG_STORE.deleteCount;
+
   const firstAlert = await webhook(readyFirst, {
     update_id: 3,
     business_message: {
@@ -382,6 +421,12 @@ try {
   assert.equal(firstSends.length, 2);
   assert.deepEqual(firstSends.map(function (call) { return call.body.text; }).sort(), ["هشدار اول", "هشدار دوم"]);
   assert.ok(firstSends.every(function (call) { return String(call.body.chat_id) === "555"; }));
+  assert.ok(await env.MESSAGE_DB.prepare(
+    "SELECT payload_cipher FROM runtime_status WHERE bot_id = ?",
+  ).bind(readyFirst.id).first());
+  assert.equal(Number((await env.MESSAGE_DB.prepare(
+    "SELECT COUNT(*) AS count FROM rule_cooldowns WHERE bot_id = ?",
+  ).bind(readyFirst.id).first()).count), 2);
 
   await webhook(readyFirst, {
     update_id: 22,
@@ -576,6 +621,8 @@ try {
   assert.equal(telegramCalls.filter(function (call) {
     return call.method === "sendMessage" && call.token === "888:TWO";
   }).length, 2);
+  assert.equal(env.CONFIG_STORE.writeCount, kvWritesBeforeMessages);
+  assert.equal(env.CONFIG_STORE.deleteCount, kvDeletesBeforeMessages);
 
   const overviewAfterMessages = await worker.fetch(new Request("https://worker.example/admin", {
     headers: { cookie: cookie },
