@@ -243,9 +243,23 @@ try {
   });
   assert.equal(secondSenderResponse.status, 303);
 
+  const sharedSenderResponse = await post("/admin/sender/save", cookie, csrf, {
+    label: "علی احمدی",
+    telegram_id: "98765",
+    enabled: "on",
+  });
+  assert.equal(sharedSenderResponse.status, 303);
+
+  const ownerSenderResponse = await post("/admin/sender/save", cookie, csrf, {
+    label: "محمد",
+    telegram_id: "555",
+    enabled: "on",
+  });
+  assert.equal(ownerSenderResponse.status, 303);
+
   state = await env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
   const configuredFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
-  assert.equal(state.senders.length, 2);
+  assert.equal(state.senders.length, 4);
   const monitoredSender = state.senders.find(function (sender) { return sender.telegramId === "12345"; });
   assert.ok(monitoredSender);
 
@@ -451,6 +465,22 @@ try {
   await drainWaiters();
   assert.equal(telegramCalls.filter(function (call) { return call.method === "sendMessage"; }).length, noMatchCount);
 
+  const countBeforeUnknownChat = Number((await env.MESSAGE_DB.prepare("SELECT COUNT(*) AS count FROM messages").first()).count);
+  await webhook(readySecond, {
+    update_id: 61,
+    business_message: {
+      message_id: 131,
+      business_connection_id: "business-two",
+      date: 1780000055,
+      from: { id: 77777, first_name: "Zari" },
+      chat: { id: 77777, type: "private", first_name: "Zari" },
+      text: "پیام چت تعریف‌نشده",
+    },
+  });
+  await drainWaiters();
+  assert.equal(Number((await env.MESSAGE_DB.prepare("SELECT COUNT(*) AS count FROM messages").first()).count), countBeforeUnknownChat);
+  assert.equal(await env.MESSAGE_DB.prepare("SELECT source_key FROM chat_sources WHERE chat_id = ?").bind("77777").first(), null);
+
   await webhook(readyFirst, {
     update_id: 7,
     business_message: {
@@ -489,6 +519,7 @@ try {
   const messagesHtml = await messagesPage.text();
   assert.match(messagesHtml, /پیام خروجی مالک/);
   assert.match(messagesHtml, /علی احمدی/);
+  assert.doesNotMatch(messagesHtml, /Zari|پیام چت تعریف‌نشده/);
   assert.match(messagesHtml, /مانیتور سایت/);
   assert.match(messagesHtml, /class='bubble incoming'/);
   assert.match(messagesHtml, /class='bubble outgoing'/);
@@ -567,7 +598,7 @@ try {
   assert.equal(forbidden.status, 403);
 
   const health = await worker.fetch(new Request("https://worker.example/health"), env, ctx);
-  assert.deepEqual(await health.json(), { ok: true, bots: 2, enabledBots: 2, senders: 2, rules: 3 });
+  assert.deepEqual(await health.json(), { ok: true, bots: 2, enabledBots: 2, senders: 4, rules: 3 });
 
   const crossOriginLogin = await worker.fetch(new Request("https://worker.example/login", {
     method: "POST",
