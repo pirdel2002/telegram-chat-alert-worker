@@ -108,7 +108,7 @@ async function renderAdmin(request, env) {
   await Promise.all(state.bots.map(async function (bot) {
     const values = await Promise.all([
       env.CONFIG_STORE.get(statusKey(bot.id), "json"),
-      loadLastMessageFromD1(env, bot.id),
+      loadLastMessageFromD1(env, bot.id, state.senders),
     ]);
     statuses[bot.id] = Object.assign({}, values[0] || {}, values[1] || {});
   }));
@@ -490,7 +490,8 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   const connection = await resolveMessageConnection(bot, message, env, state);
   const direction = connection.ownerChatId && senderId === connection.ownerChatId ? "outgoing" : "incoming";
   const messageRecord = buildMessageRecord(bot, message, update.update_id, configuredSender, direction, connection);
-  const logEnabled = await upsertChatSource(env, messageRecord);
+  const trackedChat = isTrackedChat(messageRecord, state.senders);
+  const logEnabled = trackedChat ? await upsertChatSource(env, messageRecord) : false;
   await Promise.all([
     logEnabled ? saveMessage(env, messageRecord) : Promise.resolve(),
     saveStatus(env, bot.id, {
@@ -892,22 +893,25 @@ async function loadMessagePage(env, state, filters) {
     items: matches.slice(offset, offset + filters.pageSize),
     hasNext: matches.length > offset + filters.pageSize,
     scanLimited: scanned >= scanLimit && !exhausted,
-    sources: await loadChatSources(env),
+    sources: await loadChatSources(env, state.senders),
   };
 }
 
-async function loadLastMessageFromD1(env, botId) {
-  const row = await env.MESSAGE_DB.prepare(
-    "SELECT payload_cipher FROM messages WHERE bot_id = ? ORDER BY sent_at DESC, id DESC LIMIT 1",
-  ).bind(botId).first();
-  if (!row) return null;
-  const message = await decryptMessagePayload(env, row.payload_cipher);
-  return message ? {
-    lastMessageText: message.text,
-    lastMessageSenderName: message.senderName,
-    lastMessageAt: message.timestamp,
-    lastMessageDirection: message.direction,
-  } : null;
+async function loadLastMessageFromD1(env, botId, senders) {
+  const result = await env.MESSAGE_DB.prepare(
+    "SELECT payload_cipher FROM messages WHERE bot_id = ? ORDER BY sent_at DESC, id DESC LIMIT 250",
+  ).bind(botId).all();
+  for (const row of (result.results || [])) {
+    const message = await decryptMessagePayload(env, row.payload_cipher);
+    if (!message || !isTrackedChat(message, senders)) continue;
+    return {
+      lastMessageText: message.text,
+      lastMessageSenderName: message.senderName,
+      lastMessageAt: message.timestamp,
+      lastMessageDirection: message.direction,
+    };
+  }
+  return null;
 }
 
 async function decryptMessagePayload(env, cipher) {
@@ -944,7 +948,7 @@ async function upsertChatSource(env, record) {
   return !row || Number(row.log_enabled) !== 0;
 }
 
-async function loadChatSources(env) {
+async function loadChatSources(env, senders) {
   const result = await env.MESSAGE_DB.prepare(
     "SELECT source_key, bot_id, business_connection_id, chat_id, conversation_key, owner_id, log_enabled, label_cipher, updated_at "
       + "FROM chat_sources ORDER BY updated_at DESC LIMIT 200",
@@ -952,7 +956,8 @@ async function loadChatSources(env) {
   return (await Promise.all((result.results || []).map(async function (row) {
     try {
       const labels = JSON.parse(await decryptSecret(row.label_cipher, encryptionSecret(env)));
-      return Object.assign({}, row, labels, { logEnabled: Number(row.log_enabled) !== 0 });
+      const source = Object.assign({}, row, labels, { logEnabled: Number(row.log_enabled) !== 0 });
+      return isTrackedChat({ chatId: String(row.chat_id || "") }, senders) ? source : null;
     } catch (error) {
       console.warn("Could not decrypt chat source", row.source_key, error);
       return null;
@@ -1088,6 +1093,7 @@ function validDateInput(value) {
 }
 
 function messageMatchesFilters(message, filters, senders) {
+  if (!isTrackedChat(message, senders)) return false;
   if (filters.senderRef) {
     const sender = senders.find(function (item) { return item.id === filters.senderRef; });
     if (!sender) return false;
@@ -1106,6 +1112,13 @@ function messageMatchesFilters(message, filters, senders) {
     if (!haystack.includes(normalizeText(filters.query))) return false;
   }
   return true;
+}
+
+function isTrackedChat(message, senders) {
+  const chatId = String(message.chatId || message.senderTelegramId || "");
+  return Boolean(chatId) && senders.some(function (sender) {
+    return sender.telegramId === chatId;
+  });
 }
 
 function safeAdminReturnPath(value) {
@@ -1534,7 +1547,7 @@ function messagesTab(state, messagePage, filters, csrf) {
     : "";
   const returnTo = messageFilterUrl(filters, filters.page);
   return pageHeader("پیام‌ها", "پیام‌های خوانده‌شده توسط همه بات‌ها، از قدیمی به جدید در هر صفحه", "", "")
-    + "<div class='privacy-note'>تاریخچه رمزنگاری‌شده در D1 نگهداری می‌شود. اگر یک گفتگو از دو حساب به همین بات وصل است، لاگ یکی از دو سمت را خاموش کن؛ هشدار آن سمت همچنان کار می‌کند.</div>"
+    + "<div class='privacy-note'>فقط چتِ فرستنده‌های ثبت‌شده در تاریخچه رمزنگاری‌شده D1 ذخیره می‌شود. اگر یک گفتگو از دو حساب به همین بات وصل است، لاگ یکی از دو سمت را خاموش کن؛ هشدار آن سمت همچنان کار می‌کند.</div>"
     + messageFiltersForm(state, filters)
     + chatSourcesPanel(messagePage.sources || [], csrf)
     + (messagePage.scanLimited ? "<div class='warning'>دامنه جستجو بسیار بزرگ بود؛ برای نتیجه دقیق‌تر بازه زمانی را محدود کن.</div>" : "")
@@ -1666,6 +1679,7 @@ function guideTab(csrf) {
     + "<li>هشدار در چت خصوصی مالک همان اتصال و توسط همان بات ارسال می‌شود.</li></ol></section>"
     + "<section class='card'><h2>۵. پیام‌ها و کنترل لاگ</h2><ol class='hint'>"
     + "<li>پیام‌ها در D1 و محتوای آن‌ها به‌صورت رمزنگاری‌شده ذخیره می‌شود.</li>"
+    + "<li>فقط گفت‌وگوهایی ثبت می‌شوند که شناسه عددی طرف مقابل در فرستنده‌های مشترک وجود داشته باشد؛ سایر چت‌های قابل دسترس Chat Automation لاگ نمی‌شوند. وضعیت فعال/غیرفعال فرستنده فقط روی قوانین هشدار اثر دارد.</li>"
     + "<li>می‌توانی بر اساس تاریخ، فرستنده و بات فیلتر کنی، متن را جستجو کنی و اندازه صفحه را تغییر دهی.</li>"
     + "<li>خاموش‌کردن لاگ یک سمت فقط ذخیره تاریخچه را متوقف می‌کند و قوانین هشدار را خاموش نمی‌کند.</li>"
     + "<li>حذف موردی یا گروهی پیام‌ها دائمی است؛ قبل از حذف باید هشدار را تأیید کنی.</li></ol></section>"
