@@ -499,6 +499,10 @@ try {
   assert.match(messagesHtml, /name='page_size'/);
   assert.match(messagesHtml, /حذف یک یا چند پیام انتخاب‌شده/);
   assert.match(messagesHtml, /\.sidebar\{display:none\}/);
+  assert.match(messagesHtml, /font-family:'Vazirmatn'/);
+  assert.match(messagesHtml, /class='message-select' title='انتخاب برای حذف'/);
+  assert.doesNotMatch(messagesHtml, /<span>انتخاب<\/span>/);
+  assert.match(messagesPage.headers.get("content-security-policy"), /font-src 'self' https:\/\/cdn\.jsdelivr\.net/);
 
   const filteredPage = await worker.fetch(new Request(
     "https://worker.example/admin?tab=messages&q=%D8%B4%D8%A8%DA%A9%D9%87&sender=" + monitoredSender.id + "&page_size=20",
