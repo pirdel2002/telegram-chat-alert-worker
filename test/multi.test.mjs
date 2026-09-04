@@ -152,9 +152,30 @@ try {
   }));
   const v2Health = await worker.fetch(new Request("https://worker.example/health"), v2Env, ctx);
   assert.deepEqual(await v2Health.json(), { ok: true, bots: 1, enabledBots: 1, senders: 0, rules: 1 });
-  const migratedV3 = await v2Env.CONFIG_STORE.get("telegram-alert:state:v3", "json");
-  assert.equal(migratedV3.bots[0].rules[0].senderRef, "*");
-  assert.equal(migratedV3.bots[0].rules[0].matchType, "contains");
+  const migratedV4 = await v2Env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
+  assert.equal(migratedV4.bots[0].rules[0].senderRef, "*");
+  assert.equal(migratedV4.bots[0].rules[0].matchType, "contains");
+
+  const v3Env = { CONFIG_STORE: new MemoryKV(), MESSAGE_DB: new TestD1(), ADMIN_PASSWORD: env.ADMIN_PASSWORD };
+  await v3Env.CONFIG_STORE.put("telegram-alert:state:v3", JSON.stringify({
+    version: 3,
+    bots: [{
+      id: "bot_oldone", label: "اول", tokenCipher: "cipher", rules: [{
+        id: "rule_oldone", senderRef: "sender_oldone", matchType: "any", alertMessage: "الف", enabled: true,
+      }],
+      senders: [{ id: "sender_oldone", telegramId: "12345", label: "فرستنده مشترک", enabled: true }],
+    }, {
+      id: "bot_oldtwo", label: "دوم", tokenCipher: "cipher", rules: [{
+        id: "rule_oldtwo", senderRef: "sender_oldtwo", matchType: "any", alertMessage: "ب", enabled: true,
+      }],
+      senders: [{ id: "sender_oldtwo", telegramId: "12345", label: "نام تکراری", enabled: true }],
+    }],
+  }));
+  await worker.fetch(new Request("https://worker.example/health"), v3Env, ctx);
+  const sharedMigration = await v3Env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
+  assert.equal(sharedMigration.senders.length, 1);
+  assert.equal(sharedMigration.bots[0].rules[0].senderRef, sharedMigration.senders[0].id);
+  assert.equal(sharedMigration.bots[1].rules[0].senderRef, sharedMigration.senders[0].id);
 
   const loginResponse = await worker.fetch(new Request("https://worker.example/login", {
     method: "POST",
@@ -195,7 +216,7 @@ try {
   });
   assert.equal(secondBotResponse.status, 303);
 
-  let state = await env.CONFIG_STORE.get("telegram-alert:state:v3", "json");
+  let state = await env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
   assert.equal(state.bots.length, 2);
   const firstBot = state.bots.find(function (bot) { return bot.telegramBotId === "999"; });
   const secondBot = state.bots.find(function (bot) { return bot.telegramBotId === "888"; });
@@ -209,7 +230,6 @@ try {
   assert.match(webhookCalls[0].body.url, /\/telegram-webhook\/bot_/);
 
   const firstSenderResponse = await post("/admin/sender/save", cookie, csrf, {
-    bot_id: firstBot.id,
     label: "مانیتور سایت",
     telegram_id: "12345",
     enabled: "on",
@@ -217,17 +237,16 @@ try {
   assert.equal(firstSenderResponse.status, 303);
 
   const secondSenderResponse = await post("/admin/sender/save", cookie, csrf, {
-    bot_id: firstBot.id,
     label: "مانیتور پشتیبان",
     telegram_id: "54321",
     enabled: "on",
   });
   assert.equal(secondSenderResponse.status, 303);
 
-  state = await env.CONFIG_STORE.get("telegram-alert:state:v3", "json");
+  state = await env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
   const configuredFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
-  assert.equal(configuredFirst.senders.length, 2);
-  const monitoredSender = configuredFirst.senders.find(function (sender) { return sender.telegramId === "12345"; });
+  assert.equal(state.senders.length, 2);
+  const monitoredSender = state.senders.find(function (sender) { return sender.telegramId === "12345"; });
   assert.ok(monitoredSender);
 
   const firstRule = await post("/admin/rule/save", cookie, csrf, {
@@ -263,7 +282,7 @@ try {
   });
   assert.equal(thirdRule.status, 303);
 
-  state = await env.CONFIG_STORE.get("telegram-alert:state:v3", "json");
+  state = await env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
   const currentFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
   const currentSecond = state.bots.find(function (bot) { return bot.id === secondBot.id; });
   assert.equal(currentFirst.rules.length, 2);
@@ -309,7 +328,7 @@ try {
   });
   assert.equal(connectionTwo.status, 200);
 
-  state = await env.CONFIG_STORE.get("telegram-alert:state:v3", "json");
+  state = await env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
   let readyFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
   const readySecond = state.bots.find(function (bot) { return bot.id === secondBot.id; });
   assert.equal(readyFirst.connections.length, 1);
@@ -325,7 +344,7 @@ try {
     },
   });
   assert.equal(connectionOneOtherSide.status, 200);
-  state = await env.CONFIG_STORE.get("telegram-alert:state:v3", "json");
+  state = await env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
   readyFirst = state.bots.find(function (bot) { return bot.id === firstBot.id; });
   assert.equal(readyFirst.connections.length, 2);
 
@@ -476,13 +495,30 @@ try {
   assert.match(messagesHtml, /کنترل لاگ چت‌ها/);
   assert.match(messagesHtml, /غیرفعال‌کردن لاگ این سمت/);
   assert.match(messagesHtml, /دو سمت این گفتگو شناسایی شده/);
+  assert.match(messagesHtml, /فیلتر و جستجو/);
+  assert.match(messagesHtml, /name='page_size'/);
+  assert.match(messagesHtml, /حذف یک یا چند پیام انتخاب‌شده/);
+  assert.match(messagesHtml, /\.sidebar\{display:none\}/);
+
+  const filteredPage = await worker.fetch(new Request(
+    "https://worker.example/admin?tab=messages&q=%D8%B4%D8%A8%DA%A9%D9%87&sender=" + monitoredSender.id + "&page_size=20",
+    { headers: { cookie: cookie } },
+  ), env, ctx);
+  const filteredHtml = await filteredPage.text();
+  assert.doesNotMatch(filteredHtml, /خطای شبکه رخ داد/);
+  assert.match(filteredHtml, /option value='20' selected/);
 
   const secondSource = await env.MESSAGE_DB.prepare(
     "SELECT source_key FROM chat_sources WHERE bot_id = ? AND chat_id = ?",
   ).bind(readySecond.id, "98765").first();
   assert.ok(secondSource);
+  const rejectedToggle = await post("/admin/chat-log/toggle", cookie, csrf, {
+    source_key: secondSource.source_key,
+  });
+  assert.equal(rejectedToggle.status, 400);
   const disableLog = await post("/admin/chat-log/toggle", cookie, csrf, {
     source_key: secondSource.source_key,
+    confirm: "on",
   });
   assert.equal(disableLog.status, 303);
   const countBeforeDisabledMessage = Number((await env.MESSAGE_DB.prepare("SELECT COUNT(*) AS count FROM messages").first()).count);
@@ -512,6 +548,16 @@ try {
   const overviewAfterMessagesHtml = await overviewAfterMessages.text();
   assert.match(overviewAfterMessagesHtml, /آخرین پیام/);
   assert.match(overviewAfterMessagesHtml, /پیام خروجی مالک/);
+
+  const oneMessage = await env.MESSAGE_DB.prepare("SELECT id FROM messages ORDER BY id ASC LIMIT 1").first();
+  const deleteMessage = await post("/admin/message/delete", cookie, csrf, {
+    message_ids: String(oneMessage.id),
+    confirm_delete: "on",
+    return_to: "/admin?tab=messages&page=1&page_size=20",
+  });
+  assert.equal(deleteMessage.status, 303);
+  assert.match(deleteMessage.headers.get("location"), /notice=messages-deleted/);
+  assert.equal(await env.MESSAGE_DB.prepare("SELECT id FROM messages WHERE id = ?").bind(oneMessage.id).first(), null);
 
   const forbidden = await webhook(readyFirst, {}, "wrong-secret");
   assert.equal(forbidden.status, 403);
