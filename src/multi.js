@@ -6,6 +6,7 @@ const STATUS_PREFIX = "telegram-alert:status:v2:";
 const MESSAGE_PREFIX = "telegram-alert:message:v1:";
 const KV_HISTORY_MIGRATION_KEY = "telegram-alert:d1-migration:v1";
 const RUNTIME_MIGRATION_NAME = "runtime-state-from-kv-v1";
+const APP_VERSION = "4.3.0";
 const MESSAGE_PAGE_SIZES = [20, 50, 100];
 const DISPLAY_TIME_ZONE = "Asia/Tehran";
 const SESSION_SECONDS = 12 * 60 * 60;
@@ -40,6 +41,8 @@ export default {
         const state = await loadState(env);
         return json({
           ok: true,
+          version: APP_VERSION,
+          runtimeStore: "d1",
           bots: state.bots.length,
           enabledBots: state.bots.filter(function (bot) { return bot.enabled; }).length,
           senders: state.senders.length,

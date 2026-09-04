@@ -139,7 +139,9 @@ try {
     ownerChatId: "444",
   }));
   const migrationHealth = await worker.fetch(new Request("https://worker.example/health"), migrationEnv, ctx);
-  assert.deepEqual(await migrationHealth.json(), { ok: true, bots: 1, enabledBots: 1, senders: 0, rules: 0 });
+  assert.deepEqual(await migrationHealth.json(), {
+    ok: true, version: "4.3.0", runtimeStore: "d1", bots: 1, enabledBots: 1, senders: 0, rules: 0,
+  });
 
   const v2Env = { CONFIG_STORE: new MemoryKV(), MESSAGE_DB: new TestD1(), ADMIN_PASSWORD: env.ADMIN_PASSWORD };
   await v2Env.CONFIG_STORE.put("telegram-alert:state:v2", JSON.stringify({
@@ -165,7 +167,9 @@ try {
     }],
   }));
   const v2Health = await worker.fetch(new Request("https://worker.example/health"), v2Env, ctx);
-  assert.deepEqual(await v2Health.json(), { ok: true, bots: 1, enabledBots: 1, senders: 0, rules: 1 });
+  assert.deepEqual(await v2Health.json(), {
+    ok: true, version: "4.3.0", runtimeStore: "d1", bots: 1, enabledBots: 1, senders: 0, rules: 1,
+  });
   const migratedV4 = await v2Env.CONFIG_STORE.get("telegram-alert:state:v4", "json");
   assert.equal(migratedV4.bots[0].rules[0].senderRef, "*");
   assert.equal(migratedV4.bots[0].rules[0].matchType, "contains");
@@ -645,7 +649,9 @@ try {
   assert.equal(forbidden.status, 403);
 
   const health = await worker.fetch(new Request("https://worker.example/health"), env, ctx);
-  assert.deepEqual(await health.json(), { ok: true, bots: 2, enabledBots: 2, senders: 4, rules: 3 });
+  assert.deepEqual(await health.json(), {
+    ok: true, version: "4.3.0", runtimeStore: "d1", bots: 2, enabledBots: 2, senders: 4, rules: 3,
+  });
 
   const crossOriginLogin = await worker.fetch(new Request("https://worker.example/login", {
     method: "POST",
