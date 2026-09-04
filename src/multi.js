@@ -1,11 +1,11 @@
-const STATE_KEY = "telegram-alert:state:v3";
+const STATE_KEY = "telegram-alert:state:v4";
+const V3_STATE_KEY = "telegram-alert:state:v3";
 const V2_STATE_KEY = "telegram-alert:state:v2";
 const LEGACY_CONFIG_KEY = "telegram-alert:config:v1";
 const STATUS_PREFIX = "telegram-alert:status:v2:";
 const MESSAGE_PREFIX = "telegram-alert:message:v1:";
-const LAST_MESSAGE_PREFIX = "telegram-alert:last-message:v1:";
 const KV_HISTORY_MIGRATION_KEY = "telegram-alert:d1-migration:v1";
-const MESSAGE_PAGE_SIZE = 50;
+const MESSAGE_PAGE_SIZES = [20, 50, 100];
 const DISPLAY_TIME_ZONE = "Asia/Tehran";
 const SESSION_SECONDS = 12 * 60 * 60;
 const LOGIN_WINDOW_SECONDS = 10 * 60;
@@ -41,7 +41,7 @@ export default {
           ok: true,
           bots: state.bots.length,
           enabledBots: state.bots.filter(function (bot) { return bot.enabled; }).length,
-          senders: state.bots.reduce(function (count, bot) { return count + bot.senders.length; }, 0),
+          senders: state.senders.length,
           rules: state.bots.reduce(function (count, bot) { return count + bot.rules.length; }, 0),
         });
       }
@@ -56,6 +56,7 @@ export default {
         "/admin/rule/save": saveRule,
         "/admin/rule/delete": deleteRule,
         "/admin/chat-log/toggle": toggleChatLog,
+        "/admin/message/delete": deleteMessages,
       };
       if (adminActions[url.pathname] && request.method === "POST") {
         await requireAdmin(request, env);
@@ -123,17 +124,18 @@ async function renderAdmin(request, env) {
     "rule-deleted": "قانون حذف شد.",
     "chat-log-enabled": "ثبت پیام‌های این سمت چت فعال شد.",
     "chat-log-disabled": "ثبت پیام‌های این سمت چت غیرفعال شد؛ هشدارها همچنان فعال‌اند.",
+    "messages-deleted": "پیام‌های انتخاب‌شده حذف شدند.",
   };
   const csrfToken = await csrfTokenForRequest(request, env);
   const allowedTabs = ["overview", "messages", "bots", "bot-new", "bot-edit", "senders", "sender-new", "rules", "rule-new", "guide"];
   const requestedTab = url.searchParams.get("tab") || "overview";
   const activeTab = allowedTabs.includes(requestedTab) ? requestedTab : "overview";
   const selectedBotId = url.searchParams.get("bot") || "";
-  const cursor = String(url.searchParams.get("cursor") || "");
+  const messageFilters = parseMessageFilters(url.searchParams);
   const messagePage = activeTab === "messages"
-    ? await loadMessagePage(env, cursor.length <= 2048 ? cursor : "")
+    ? await loadMessagePage(env, state, messageFilters)
     : { items: [], nextCursor: "", sources: [] };
-  return html(adminPage(state, statuses, notices[noticeCode] || "", csrfToken, activeTab, selectedBotId, messagePage));
+  return html(adminPage(state, statuses, notices[noticeCode] || "", csrfToken, activeTab, selectedBotId, messagePage, messageFilters));
 }
 
 async function saveBot(request, env) {
@@ -194,7 +196,6 @@ async function saveBot(request, env) {
     businessConnectionId: sameTelegramBot ? (existing.businessConnectionId || "") : "",
     connectionEnabled: sameTelegramBot ? existing.connectionEnabled !== false : false,
     connections: sameTelegramBot && Array.isArray(existing.connections) ? existing.connections : [],
-    senders: existing ? existing.senders : [],
     rules: existing ? existing.rules : [],
     updatedAt: new Date().toISOString(),
   };
@@ -276,7 +277,6 @@ async function deleteBot(request, env) {
 async function saveSender(request, env) {
   const form = await request.formData();
   const state = await loadState(env);
-  const bot = requireBot(state, form.get("bot_id"));
   const submittedSenderId = String(form.get("sender_id") || "");
   const senderId = submittedSenderId
     ? requireSafeId(submittedSenderId, "شناسه داخلی فرستنده")
@@ -286,10 +286,10 @@ async function saveSender(request, env) {
   const enabled = form.get("enabled") === "on";
 
   if (!label || label.length > 80) throw badRequest("نام فرستنده باید بین ۱ تا ۸۰ نویسه باشد.");
-  const duplicate = bot.senders.find(function (sender) {
+  const duplicate = state.senders.find(function (sender) {
     return sender.telegramId === telegramId && sender.id !== senderId;
   });
-  if (duplicate) throw badRequest("این شناسه عددی قبلاً برای همین بات ثبت شده است.");
+  if (duplicate) throw badRequest("این شناسه عددی قبلاً در فهرست مشترک فرستنده‌ها ثبت شده است.");
 
   const sender = {
     id: senderId,
@@ -298,33 +298,34 @@ async function saveSender(request, env) {
     enabled: enabled,
     updatedAt: new Date().toISOString(),
   };
-  const senderIndex = bot.senders.findIndex(function (item) { return item.id === senderId; });
-  if (senderIndex >= 0) bot.senders[senderIndex] = sender;
-  else bot.senders.push(sender);
-  bot.updatedAt = new Date().toISOString();
+  const senderIndex = state.senders.findIndex(function (item) { return item.id === senderId; });
+  if (senderIndex >= 0) state.senders[senderIndex] = sender;
+  else state.senders.push(sender);
   await saveState(env, state);
-  return redirect("/admin?tab=senders&bot=" + encodeURIComponent(bot.id) + "&notice=sender-saved");
+  return redirect("/admin?tab=senders&notice=sender-saved");
 }
 
 async function deleteSender(request, env) {
   const form = await request.formData();
   const state = await loadState(env);
-  const bot = requireBot(state, form.get("bot_id"));
   const senderId = requireSafeId(String(form.get("sender_id") || ""), "شناسه داخلی فرستنده");
-  if (!bot.senders.some(function (sender) { return sender.id === senderId; })) {
+  if (!state.senders.some(function (sender) { return sender.id === senderId; })) {
     throw badRequest("فرستنده پیدا نشد.");
   }
-  const removedRuleIds = bot.rules
-    .filter(function (rule) { return rule.senderRef === senderId; })
-    .map(function (rule) { return rule.id; });
-  bot.senders = bot.senders.filter(function (sender) { return sender.id !== senderId; });
-  bot.rules = bot.rules.filter(function (rule) { return rule.senderRef !== senderId; });
-  bot.updatedAt = new Date().toISOString();
+  const removedRules = [];
+  state.bots.forEach(function (bot) {
+    bot.rules.filter(function (rule) { return rule.senderRef === senderId; }).forEach(function (rule) {
+      removedRules.push({ botId: bot.id, ruleId: rule.id });
+    });
+    bot.rules = bot.rules.filter(function (rule) { return rule.senderRef !== senderId; });
+    bot.updatedAt = new Date().toISOString();
+  });
+  state.senders = state.senders.filter(function (sender) { return sender.id !== senderId; });
   await saveState(env, state);
-  await Promise.all(removedRuleIds.map(function (ruleId) {
-    return env.CONFIG_STORE.delete(cooldownKey(bot.id, ruleId));
+  await Promise.all(removedRules.map(function (rule) {
+    return env.CONFIG_STORE.delete(cooldownKey(rule.botId, rule.ruleId));
   }));
-  return redirect("/admin?tab=senders&bot=" + encodeURIComponent(bot.id) + "&notice=sender-deleted");
+  return redirect("/admin?tab=senders&notice=sender-deleted");
 }
 
 async function saveRule(request, env) {
@@ -340,7 +341,7 @@ async function saveRule(request, env) {
   const cooldownSeconds = clampInteger(form.get("cooldown_seconds"), 0, 86400, 300);
   const enabled = form.get("enabled") === "on";
 
-  if (senderRef !== "*" && !bot.senders.some(function (sender) { return sender.id === senderRef; })) {
+  if (senderRef !== "*" && !state.senders.some(function (sender) { return sender.id === senderRef; })) {
     throw badRequest("فرستنده انتخاب‌شده معتبر نیست.");
   }
   if (!["any", "contains"].includes(matchType)) throw badRequest("نوع فیلتر پیام معتبر نیست.");
@@ -386,6 +387,7 @@ async function deleteRule(request, env) {
 
 async function toggleChatLog(request, env) {
   const form = await request.formData();
+  if (form.get("confirm") !== "on") throw badRequest("برای تغییر وضعیت لاگ، تأیید هشدار الزامی است.");
   const sourceKey = String(form.get("source_key") || "");
   if (!sourceKey || sourceKey.length > 500) throw badRequest("منبع چت معتبر نیست.");
   const enabled = form.get("log_enabled") === "on" ? 1 : 0;
@@ -394,6 +396,25 @@ async function toggleChatLog(request, env) {
   ).bind(enabled, Math.floor(Date.now() / 1000), sourceKey).run();
   if (!result.meta || Number(result.meta.changes) < 1) throw badRequest("منبع چت پیدا نشد.");
   return redirect("/admin?tab=messages&notice=" + (enabled ? "chat-log-enabled" : "chat-log-disabled"));
+}
+
+async function deleteMessages(request, env) {
+  const form = await request.formData();
+  if (form.get("confirm_delete") !== "on") throw badRequest("برای حذف پیام‌ها، تأیید حذف الزامی است.");
+  const ids = form.getAll("message_ids").map(function (value) {
+    return Number(value);
+  }).filter(function (value) {
+    return Number.isSafeInteger(value) && value > 0;
+  }).filter(function (value, index, list) {
+    return list.indexOf(value) === index;
+  });
+  if (!ids.length) throw badRequest("حداقل یک پیام را انتخاب کن.");
+  if (ids.length > 100) throw badRequest("در هر بار حداکثر ۱۰۰ پیام قابل حذف است.");
+  await env.MESSAGE_DB.batch(ids.map(function (id) {
+    return env.MESSAGE_DB.prepare("DELETE FROM messages WHERE id = ?").bind(id);
+  }));
+  const returnTo = safeAdminReturnPath(String(form.get("return_to") || ""));
+  return redirect(returnTo + (returnTo.includes("?") ? "&" : "?") + "notice=messages-deleted");
 }
 
 async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
@@ -463,7 +484,7 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   const senderId = String((message.from && message.from.id) || "");
   const incomingText = String(message.text || message.caption || "");
   const normalizedIncoming = normalizeText(incomingText);
-  const configuredSender = bot.senders.find(function (sender) {
+  const configuredSender = state.senders.find(function (sender) {
     return sender.enabled && sender.telegramId === senderId;
   });
   const connection = await resolveMessageConnection(bot, message, env, state);
@@ -484,7 +505,7 @@ async function handleTelegramWebhook(request, env, ctx, requestedBotId) {
   const matchedRules = bot.rules.filter(function (rule) {
     if (!rule.enabled) return false;
     if (rule.senderRef !== "*") {
-      const selectedSender = bot.senders.find(function (sender) {
+      const selectedSender = state.senders.find(function (sender) {
         return sender.id === rule.senderRef && sender.enabled;
       });
       if (!selectedSender || selectedSender.telegramId !== senderId) return false;
@@ -632,6 +653,13 @@ async function loadState(env) {
   const stored = await env.CONFIG_STORE.get(STATE_KEY, "json");
   if (stored && Array.isArray(stored.bots)) return normalizeState(stored);
 
+  const v3 = await env.CONFIG_STORE.get(V3_STATE_KEY, "json");
+  if (v3 && Array.isArray(v3.bots)) {
+    const migrated = normalizeState(v3);
+    await saveState(env, migrated);
+    return migrated;
+  }
+
   const v2 = await env.CONFIG_STORE.get(V2_STATE_KEY, "json");
   if (v2 && Array.isArray(v2.bots)) {
     const migrated = normalizeState(v2);
@@ -640,7 +668,7 @@ async function loadState(env) {
   }
 
   const old = await env.CONFIG_STORE.get(LEGACY_CONFIG_KEY, "json");
-  const state = { version: 3, bots: [], updatedAt: new Date().toISOString() };
+  const state = { version: 4, senders: [], bots: [], updatedAt: new Date().toISOString() };
   if (old && old.tokenCipher) {
     state.bots.push({
       id: "legacy_" + String(old.botId || "bot").replace(/[^A-Za-z0-9_-]/g, ""),
@@ -671,11 +699,37 @@ async function loadState(env) {
 }
 
 function normalizeState(state) {
-  return {
-    version: 3,
-    updatedAt: state.updatedAt || "",
-    bots: state.bots.map(function (bot) {
-      return {
+  const globalSenders = [];
+  const senderByTelegramId = new Map();
+  const senderIdOwner = new Map();
+  const addGlobalSender = function (sender) {
+    const normalized = {
+      id: String(sender.id || ("sender_" + randomToken(9))),
+      telegramId: String(sender.telegramId || ""),
+      label: String(sender.label || sender.telegramId || "فرستنده"),
+      enabled: sender.enabled !== false,
+      updatedAt: sender.updatedAt || "",
+    };
+    if (!normalized.telegramId) return null;
+    const byTelegram = senderByTelegramId.get(normalized.telegramId);
+    if (byTelegram) return byTelegram;
+    if (senderIdOwner.has(normalized.id) && senderIdOwner.get(normalized.id) !== normalized.telegramId) {
+      normalized.id = "sender_" + randomToken(9);
+    }
+    globalSenders.push(normalized);
+    senderByTelegramId.set(normalized.telegramId, normalized);
+    senderIdOwner.set(normalized.id, normalized.telegramId);
+    return normalized;
+  };
+  (Array.isArray(state.senders) ? state.senders : []).forEach(addGlobalSender);
+
+  const bots = state.bots.map(function (bot) {
+    const senderRefMap = new Map();
+    (Array.isArray(bot.senders) ? bot.senders : []).forEach(function (sender) {
+      const globalSender = addGlobalSender(sender);
+      if (globalSender) senderRefMap.set(String(sender.id), globalSender.id);
+    });
+    return {
         id: String(bot.id),
         label: String(bot.label || bot.botUsername || "بات"),
         tokenCipher: String(bot.tokenCipher || ""),
@@ -704,19 +758,10 @@ function normalizeState(state) {
             enabled: bot.connectionEnabled !== false,
             updatedAt: bot.updatedAt || "",
           }] : []),
-        senders: Array.isArray(bot.senders) ? bot.senders.map(function (sender) {
-          return {
-            id: String(sender.id),
-            telegramId: String(sender.telegramId || ""),
-            label: String(sender.label || sender.telegramId || "فرستنده"),
-            enabled: sender.enabled !== false,
-            updatedAt: sender.updatedAt || "",
-          };
-        }) : [],
         rules: Array.isArray(bot.rules) ? bot.rules.map(function (rule) {
           return {
             id: String(rule.id),
-            senderRef: String(rule.senderRef || "*"),
+            senderRef: senderRefMap.get(String(rule.senderRef || "*")) || String(rule.senderRef || "*"),
             matchType: rule.matchType === "any" ? "any" : "contains",
             keyword: String(rule.keyword || ""),
             alertMessage: String(rule.alertMessage || ""),
@@ -727,12 +772,17 @@ function normalizeState(state) {
         }) : [],
         updatedAt: bot.updatedAt || "",
       };
-    }),
+  });
+  return {
+    version: 4,
+    updatedAt: state.updatedAt || "",
+    senders: globalSenders,
+    bots: bots,
   };
 }
 
 async function saveState(env, state) {
-  state.version = 3;
+  state.version = 4;
   state.updatedAt = new Date().toISOString();
   await env.CONFIG_STORE.put(STATE_KEY, JSON.stringify(state));
 }
@@ -764,6 +814,8 @@ function buildMessageRecord(bot, message, updateId, configuredSender, direction,
     ownerId: String(connection.ownerChatId || ""),
     ownerName: String(connection.ownerName || "حساب متصل"),
     chatId: chatId,
+    senderRef: configuredSender ? configuredSender.id : "",
+    senderTelegramId: String((message.from && message.from.id) || ""),
     senderName: senderName,
     chatName: chatName,
     direction: direction,
@@ -788,24 +840,58 @@ async function saveMessage(env, record) {
   ).run();
 }
 
-async function loadMessagePage(env, cursor) {
-  const cursorMatch = String(cursor || "").match(/^(\d+):(\d+)$/);
-  const sql = cursorMatch
-    ? "SELECT id, sent_at, payload_cipher FROM messages WHERE sent_at < ? OR (sent_at = ? AND id < ?) ORDER BY sent_at DESC, id DESC LIMIT ?"
-    : "SELECT id, sent_at, payload_cipher FROM messages ORDER BY sent_at DESC, id DESC LIMIT ?";
-  const statement = env.MESSAGE_DB.prepare(sql);
-  const result = cursorMatch
-    ? await statement.bind(Number(cursorMatch[1]), Number(cursorMatch[1]), Number(cursorMatch[2]), MESSAGE_PAGE_SIZE + 1).all()
-    : await statement.bind(MESSAGE_PAGE_SIZE + 1).all();
-  const rows = result.results || [];
-  const pageRows = rows.slice(0, MESSAGE_PAGE_SIZE);
-  const items = (await Promise.all(pageRows.map(function (row) {
-    return decryptMessagePayload(env, row.payload_cipher);
-  }))).filter(Boolean);
-  const lastRow = pageRows[pageRows.length - 1];
+async function loadMessagePage(env, state, filters) {
+  const offset = (filters.page - 1) * filters.pageSize;
+  const wanted = offset + filters.pageSize + 1;
+  const matches = [];
+  const batchSize = 250;
+  const scanLimit = 20000;
+  let scanned = 0;
+  let cursor = null;
+  let exhausted = false;
+  while (matches.length < wanted && scanned < scanLimit && !exhausted) {
+    const clauses = [];
+    const values = [];
+    if (filters.fromTimestamp) {
+      clauses.push("sent_at >= ?");
+      values.push(filters.fromTimestamp);
+    }
+    if (filters.toTimestamp) {
+      clauses.push("sent_at < ?");
+      values.push(filters.toTimestamp);
+    }
+    if (filters.botId) {
+      clauses.push("bot_id = ?");
+      values.push(filters.botId);
+    }
+    if (cursor) {
+      clauses.push("(sent_at < ? OR (sent_at = ? AND id < ?))");
+      values.push(cursor.sentAt, cursor.sentAt, cursor.id);
+    }
+    const sql = "SELECT id, sent_at, payload_cipher FROM messages"
+      + (clauses.length ? " WHERE " + clauses.join(" AND ") : "")
+      + " ORDER BY sent_at DESC, id DESC LIMIT ?";
+    values.push(batchSize);
+    const result = await env.MESSAGE_DB.prepare(sql).bind(...values).all();
+    const rows = result.results || [];
+    scanned += rows.length;
+    exhausted = rows.length < batchSize;
+    if (rows.length) {
+      const last = rows[rows.length - 1];
+      cursor = { sentAt: Number(last.sent_at), id: Number(last.id) };
+    }
+    const decoded = await Promise.all(rows.map(async function (row) {
+      const message = await decryptMessagePayload(env, row.payload_cipher);
+      return message ? Object.assign({}, message, { databaseId: Number(row.id) }) : null;
+    }));
+    decoded.filter(Boolean).forEach(function (message) {
+      if (messageMatchesFilters(message, filters, state.senders)) matches.push(message);
+    });
+  }
   return {
-    items: items,
-    nextCursor: rows.length > MESSAGE_PAGE_SIZE && lastRow ? lastRow.sent_at + ":" + lastRow.id : "",
+    items: matches.slice(offset, offset + filters.pageSize),
+    hasNext: matches.length > offset + filters.pageSize,
+    scanLimited: scanned >= scanLimit && !exhausted,
     sources: await loadChatSources(env),
   };
 }
@@ -976,6 +1062,55 @@ function normalizeText(value) {
     .replace(/\s+/g, " ")
     .trim()
     .toLocaleLowerCase("fa");
+}
+
+function parseMessageFilters(searchParams) {
+  const pageSizeValue = clampInteger(searchParams.get("page_size"), 20, 100, 50);
+  const pageSize = MESSAGE_PAGE_SIZES.includes(pageSizeValue) ? pageSizeValue : 50;
+  const from = validDateInput(searchParams.get("from"));
+  const to = validDateInput(searchParams.get("to"));
+  return {
+    page: clampInteger(searchParams.get("page"), 1, 100000, 1),
+    pageSize: pageSize,
+    senderRef: String(searchParams.get("sender") || "").slice(0, 80),
+    botId: String(searchParams.get("message_bot") || "").slice(0, 80),
+    query: String(searchParams.get("q") || "").trim().slice(0, 200),
+    from: from,
+    to: to,
+    fromTimestamp: from ? Math.floor(Date.parse(from + "T00:00:00+03:30") / 1000) : 0,
+    toTimestamp: to ? Math.floor(Date.parse(to + "T00:00:00+03:30") / 1000) + 86400 : 0,
+  };
+}
+
+function validDateInput(value) {
+  const text = String(value || "");
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) && !Number.isNaN(Date.parse(text + "T00:00:00Z")) ? text : "";
+}
+
+function messageMatchesFilters(message, filters, senders) {
+  if (filters.senderRef) {
+    const sender = senders.find(function (item) { return item.id === filters.senderRef; });
+    if (!sender) return false;
+    const matchesSender = message.senderRef === sender.id
+      || String(message.senderTelegramId || "") === sender.telegramId
+      || (!message.senderRef && String(message.senderName || "") === sender.label);
+    if (!matchesSender) return false;
+  }
+  if (filters.query) {
+    const haystack = normalizeText([
+      message.text,
+      message.senderName,
+      message.chatName,
+      message.botLabel,
+    ].join(" "));
+    if (!haystack.includes(normalizeText(filters.query))) return false;
+  }
+  return true;
+}
+
+function safeAdminReturnPath(value) {
+  if (!value.startsWith("/admin?tab=messages")) return "/admin?tab=messages";
+  return value.replace(/[\r\n]/g, "").slice(0, 1800);
 }
 
 async function telegramApi(token, method, payload) {
@@ -1220,10 +1355,10 @@ function layout(title, content) {
     "label{display:block;color:#c8d8eb;font-size:13px;margin:0 0 7px}input,textarea,select{width:100%;border:1px solid var(--line);background:#081525;color:var(--text);border-radius:12px;padding:12px 13px;font:inherit;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #3aa0ff22}textarea{min-height:86px;resize:vertical}",
     ".hint{color:var(--muted);font-size:12px;line-height:1.8;margin:6px 0 0}.check{display:flex;gap:9px;align-items:center}.check input{width:auto;accent-color:var(--accent)}button{border:0;border-radius:12px;padding:11px 15px;background:var(--accent);color:white;font:inherit;font-weight:bold;cursor:pointer}.secondary{background:#213752}.danger{background:#6b2533}",
     ".actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}.actions form{margin:0}.status{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.stat{background:#091626;border:1px solid var(--line);padding:11px;border-radius:12px}.stat b{display:block;margin-top:5px;font-size:13px;word-break:break-word}.muted{color:var(--muted)}",
-    ".notice{padding:13px 15px;border-radius:12px;margin-bottom:16px;background:#123b33;border:1px solid #1b6a58}.pill{display:inline-flex;padding:4px 9px;border-radius:999px;background:#174438;color:#8ef0d2;font-size:12px}.pill.off{background:#46232e;color:#ffb1bf}.divider{height:1px;background:var(--line);margin:18px 0}.rule{background:#0a1728;border:1px solid var(--line);border-radius:15px;padding:14px;margin-top:12px}",
-    ".chat-card{padding:12px}.chat-stream{display:flex;flex-direction:column;gap:9px;background:#071321;border-radius:15px;padding:16px;min-height:220px}.bubble{width:fit-content;max-width:min(76%,680px);border:1px solid var(--line);border-radius:16px;padding:10px 12px;box-shadow:0 8px 20px #0003}.bubble.incoming{margin-right:auto;background:#12243a;border-bottom-left-radius:4px}.bubble.outgoing{margin-left:auto;background:#164537;border-color:#256653;border-bottom-right-radius:4px}.bubble-head{display:flex;gap:8px;align-items:center;justify-content:space-between;color:#8fc8ff;font-size:12px;margin-bottom:6px}.bubble.outgoing .bubble-head{color:#8ef0d2}.bubble-text{white-space:normal;overflow-wrap:anywhere;line-height:1.8}.bubble-meta{display:flex;gap:8px;justify-content:flex-end;color:var(--muted);font-size:10px;margin-top:6px}.day{align-self:center;background:#1c3149;color:#cfe3f8;border-radius:999px;padding:5px 11px;font-size:11px;margin:8px 0}.last-message{display:block;line-height:1.7}.last-message small{display:block;color:var(--muted);font-weight:normal}.pager{display:flex;justify-content:center;margin:14px 0}.privacy-note{margin-bottom:12px;padding:10px 12px;border-radius:12px;background:#183349;color:#b9d9f4;font-size:12px}.source-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:16px}.source{background:#0a1728;border:1px solid var(--line);border-radius:15px;padding:13px}.source h3{margin-bottom:6px}.source .actions{margin-top:10px}.source .actions button{width:100%}",
+    ".notice{padding:13px 15px;border-radius:12px;margin-bottom:16px;background:#123b33;border:1px solid #1b6a58}.warning{padding:13px 15px;border-radius:12px;margin-bottom:16px;background:#453714;border:1px solid #745f25;color:#ffe29a}.pill{display:inline-flex;padding:4px 9px;border-radius:999px;background:#174438;color:#8ef0d2;font-size:12px}.pill.off{background:#46232e;color:#ffb1bf}.divider{height:1px;background:var(--line);margin:18px 0}.rule{background:#0a1728;border:1px solid var(--line);border-radius:15px;padding:14px;margin-top:12px}",
+    ".filters .filter-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.filters .wide{grid-column:span 2}.chat-card{padding:12px}.chat-stream{display:flex;flex-direction:column;gap:9px;background:#071321;border-radius:15px;padding:16px;min-height:220px}.bubble{position:relative;width:fit-content;max-width:min(76%,680px);border:1px solid var(--line);border-radius:16px;padding:10px 12px;box-shadow:0 8px 20px #0003}.bubble.incoming{margin-right:auto;background:#12243a;border-bottom-left-radius:4px}.bubble.outgoing{margin-left:auto;background:#164537;border-color:#256653;border-bottom-right-radius:4px}.message-select{display:flex;gap:5px;align-items:center;color:var(--muted);font-size:10px;margin-bottom:6px}.message-select input{width:auto}.bubble-head{display:flex;gap:8px;align-items:center;justify-content:space-between;color:#8fc8ff;font-size:12px;margin-bottom:6px}.bubble.outgoing .bubble-head{color:#8ef0d2}.bubble-text{white-space:normal;overflow-wrap:anywhere;line-height:1.8}.bubble-meta{display:flex;gap:8px;justify-content:flex-end;color:var(--muted);font-size:10px;margin-top:6px}.day{align-self:center;background:#1c3149;color:#cfe3f8;border-radius:999px;padding:5px 11px;font-size:11px;margin:8px 0}.last-message{display:block;line-height:1.7}.last-message small{display:block;color:var(--muted);font-weight:normal}.pager{display:flex;gap:10px;align-items:center;justify-content:center;margin:14px 0}.page-number{color:var(--muted);font-size:12px}.bulk-bar{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 4px 2px}.bulk-bar .check{font-size:12px;color:#ffb1bf}.privacy-note{margin-bottom:12px;padding:10px 12px;border-radius:12px;background:#183349;color:#b9d9f4;font-size:12px}.source-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:16px}.source{background:#0a1728;border:1px solid var(--line);border-radius:15px;padding:13px}.source h3{margin-bottom:6px}.source .actions{margin-top:10px}.source .actions button{width:100%}.log-warning{width:100%;color:#ffcf8a;font-size:11px;align-items:flex-start}",
     ".login{width:min(430px,calc(100% - 28px));margin:14vh auto}.login button{width:100%;margin-top:14px}.foot{color:var(--muted);text-align:center;font-size:11px;margin-top:16px}.empty{padding:15px;border:1px dashed var(--line);border-radius:12px;color:var(--muted)}",
-    "@media(max-width:760px){.shell{display:block}.sidebar{position:static;margin-bottom:12px;padding:9px}.nav{flex-direction:row;overflow-x:auto}.nav a{white-space:nowrap}.botlinks,.side-title{display:none}.grid,.status,.source-grid{grid-template-columns:1fr}.full{grid-column:auto}.wrap{margin-top:12px}.card{padding:16px}.bothead,.pagehead{display:block}.bothead .pill,.pagehead .btn{margin-top:9px}.actions button,.actions .btn{width:100%}.actions form{flex:1 1 100%}}",
+    "@media(max-width:760px){.shell{display:block}.sidebar{display:none}.grid,.status,.source-grid,.filters .filter-grid{grid-template-columns:1fr}.filters .wide{grid-column:auto}.full{grid-column:auto}.wrap{margin-top:12px}.card{padding:16px}.bothead,.pagehead{display:block}.bothead .pill,.pagehead .btn{margin-top:9px}.actions button,.actions .btn{width:100%}.actions form{flex:1 1 100%}.bubble{max-width:88%}.bulk-bar{display:block}.bulk-bar button{width:100%;margin-top:10px}}",
   ].join("");
   return "<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'>"
     + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -1242,7 +1377,7 @@ function loginPage(error) {
     + "<p class='foot'>توکن بات‌ها به‌صورت رمزنگاری‌شده نگهداری می‌شود.</p></main>");
 }
 
-function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId, messagePage) {
+function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId, messagePage, messageFilters) {
   const csrf = csrfInput(csrfToken);
   const selectedBot = state.bots.find(function (bot) { return bot.id === selectedBotId; })
     || state.bots[0] || null;
@@ -1258,7 +1393,7 @@ function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId,
     ["rules", "هشدارها"],
     ["guide", "راهنما"],
   ].map(function (item) {
-    const botPart = selectedBot && ["senders", "rules"].includes(item[0]) ? "&bot=" + encodeURIComponent(selectedBot.id) : "";
+    const botPart = selectedBot && item[0] === "rules" ? "&bot=" + encodeURIComponent(selectedBot.id) : "";
     return "<a class='tab" + (section === item[0] ? " active" : "") + "' href='/admin?tab="
       + item[0] + botPart + "'>" + item[1] + "</a>";
   }).join("");
@@ -1270,14 +1405,14 @@ function adminPage(state, statuses, notice, csrfToken, activeTab, selectedBotId,
     + sideLink("overview", "⌂ نمای کلی", section)
     + sideLink("messages", "💬 پیام‌ها", section)
     + sideLink("bots", "🤖 مدیریت بات‌ها", section)
-    + sideLink("senders", "👤 فرستنده‌ها", section, selectedBot)
+    + sideLink("senders", "👤 فرستنده‌ها", section)
     + sideLink("rules", "🔔 هشدارها", section, selectedBot)
     + sideLink("guide", "؟ راهنما", section)
     + "</nav><div class='botlinks'><div class='side-title'>بات‌ها</div>"
     + (sidebarBots || "<div class='hint'>هنوز باتی نیست</div>") + "</div>"
     + "<form method='post' action='/logout' class='actions'>" + csrf
     + "<button class='secondary' type='submit'>خروج</button></form></aside>";
-  const content = renderTab(activeTab, state, selectedBot, statuses, csrf, messagePage);
+  const content = renderTab(activeTab, state, selectedBot, statuses, csrf, messagePage, messageFilters);
   const page = "<main class='wrap'><div class='brand'><div class='logo'>🔔</div><div>"
     + "<h1>پنل هشدار تلگرام</h1><p>چند بات، چند فرستنده و چند فیلتر مستقل</p></div></div>"
     + "<div class='tabs'>" + tabs + "</div>"
@@ -1292,7 +1427,7 @@ function sideLink(tab, label, activeSection, bot) {
     + label + "</a>";
 }
 
-function renderTab(activeTab, state, bot, statuses, csrf, messagePage) {
+function renderTab(activeTab, state, bot, statuses, csrf, messagePage, messageFilters) {
   if (activeTab === "bot-new") {
     return pageHeader("افزودن بات جدید", "", "/admin?tab=bots", "بازگشت")
       + "<section class='card'>" + botForm(null, csrf) + "</section>";
@@ -1308,25 +1443,24 @@ function renderTab(activeTab, state, bot, statuses, csrf, messagePage) {
       + "</div></section>";
   }
   if (activeTab === "sender-new") {
-    if (!bot) return emptyBots();
-    return pageHeader("افزودن فرستنده به " + bot.label, "", "/admin?tab=senders&bot=" + encodeURIComponent(bot.id), "بازگشت")
-      + "<section class='card'>" + senderForm(bot, null, csrf) + "</section>";
+    return pageHeader("افزودن فرستنده مشترک", "این فرستنده در هشدارهای همه بات‌ها قابل انتخاب است", "/admin?tab=senders", "بازگشت")
+      + "<section class='card'>" + senderForm(null, csrf) + "</section>";
   }
   if (activeTab === "rule-new") {
     if (!bot) return emptyBots();
     return pageHeader("افزودن هشدار به " + bot.label, "", "/admin?tab=rules&bot=" + encodeURIComponent(bot.id), "بازگشت")
-      + "<section class='card'>" + ruleEditor(bot, null, csrf) + "</section>";
+      + "<section class='card'>" + ruleEditor(bot, state.senders, null, csrf) + "</section>";
   }
   if (activeTab === "bots") return botsTab(state, statuses, csrf);
-  if (activeTab === "messages") return messagesTab(messagePage, csrf);
-  if (activeTab === "senders") return sendersTab(state, bot, csrf);
+  if (activeTab === "messages") return messagesTab(state, messagePage, messageFilters, csrf);
+  if (activeTab === "senders") return sendersTab(state, csrf);
   if (activeTab === "rules") return rulesTab(state, bot, csrf);
   if (activeTab === "guide") return guideTab(csrf);
   return overviewTab(state, statuses, csrf);
 }
 
 function overviewTab(state, statuses, csrf) {
-  const senderCount = state.bots.reduce(function (sum, bot) { return sum + bot.senders.length; }, 0);
+  const senderCount = state.senders.length;
   const ruleCount = state.bots.reduce(function (sum, bot) { return sum + bot.rules.length; }, 0);
   const connectedCount = state.bots.filter(function (bot) {
     return activeConnections(bot).length > 0 || (bot.ownerChatId && bot.connectionEnabled !== false);
@@ -1362,17 +1496,17 @@ function botSummary(bot, status, csrf) {
     + "<span class='pill" + (bot.enabled ? "" : " off") + "'>" + (bot.enabled ? "فعال" : "غیرفعال") + "</span></div>"
     + "<div class='status'>"
     + stat("Chat Automation", connected ? "<span class='pill'>" + connectionCount + " اتصال</span>" : "<span class='pill off'>منتظر اتصال</span>", true)
-    + stat("فرستنده‌ها", String(bot.senders.length))
+    + stat("فرستنده‌های مشترک", "در تب فرستنده‌ها")
     + stat("هشدارها", String(bot.rules.length))
     + stat("آخرین پیام", lastMessage, true)
     + "</div><div class='actions'>"
     + "<a class='btn secondary' href='/admin?tab=bot-edit&bot=" + encodeURIComponent(bot.id) + "'>تنظیمات بات</a>"
-    + "<a class='btn secondary' href='/admin?tab=sender-new&bot=" + encodeURIComponent(bot.id) + "'>＋ افزودن فرستنده</a>"
+    + "<a class='btn secondary' href='/admin?tab=sender-new'>＋ افزودن فرستنده</a>"
     + "<a class='btn' href='/admin?tab=rule-new&bot=" + encodeURIComponent(bot.id) + "'>＋ افزودن هشدار</a>"
     + "</div></section>";
 }
 
-function messagesTab(messagePage, csrf) {
+function messagesTab(state, messagePage, filters, csrf) {
   const chronological = (messagePage.items || []).slice().reverse();
   let previousDay = "";
   const messages = chronological.map(function (message) {
@@ -1382,21 +1516,69 @@ function messagesTab(messagePage, csrf) {
     const direction = message.direction === "outgoing" ? "outgoing" : "incoming";
     const directionLabel = direction === "outgoing" ? "خروجی" : "ورودی";
     const safeText = escapeHtml(message.text || "پیام غیرمتنی").replace(/\r?\n/g, "<br>");
-    return separator + "<article class='bubble " + direction + "'><div class='bubble-head'><strong>"
+    return separator + "<article class='bubble " + direction + "'><label class='message-select'><input type='checkbox' name='message_ids' value='"
+      + escapeHtml(String(message.databaseId)) + "'><span>انتخاب</span></label><div class='bubble-head'><strong>"
       + escapeHtml(message.senderName || "ناشناس") + "</strong><span>" + escapeHtml(message.botLabel || "بات")
       + "</span></div><div class='bubble-text'>" + safeText + "</div><div class='bubble-meta'><span>"
       + directionLabel + "</span><time>" + escapeHtml(formatMessageTime(message.timestamp)) + "</time></div></article>";
   }).join("");
-  const older = messagePage.nextCursor
-    ? "<div class='pager'><a class='btn secondary' href='/admin?tab=messages&cursor="
-      + encodeURIComponent(messagePage.nextCursor) + "'>نمایش ۵۰ پیام قدیمی‌تر</a></div>"
+  const previous = filters.page > 1
+    ? "<a class='btn secondary' href='" + escapeHtml(messageFilterUrl(filters, filters.page - 1)) + "'>صفحه قبل</a>"
     : "";
+  const next = messagePage.hasNext
+    ? "<a class='btn secondary' href='" + escapeHtml(messageFilterUrl(filters, filters.page + 1)) + "'>صفحه بعد</a>"
+    : "";
+  const pagination = previous || next
+    ? "<div class='pager'>" + previous + "<span class='page-number'>صفحه " + filters.page + "</span>" + next + "</div>"
+    : "";
+  const returnTo = messageFilterUrl(filters, filters.page);
   return pageHeader("پیام‌ها", "پیام‌های خوانده‌شده توسط همه بات‌ها، از قدیمی به جدید در هر صفحه", "", "")
     + "<div class='privacy-note'>تاریخچه رمزنگاری‌شده در D1 نگهداری می‌شود. اگر یک گفتگو از دو حساب به همین بات وصل است، لاگ یکی از دو سمت را خاموش کن؛ هشدار آن سمت همچنان کار می‌کند.</div>"
+    + messageFiltersForm(state, filters)
     + chatSourcesPanel(messagePage.sources || [], csrf)
+    + (messagePage.scanLimited ? "<div class='warning'>دامنه جستجو بسیار بزرگ بود؛ برای نتیجه دقیق‌تر بازه زمانی را محدود کن.</div>" : "")
     + (messages
-      ? "<section class='card chat-card'><div class='chat-stream'>" + messages + "</div></section>" + older
-      : "<section class='card empty'>هنوز پیامی توسط بات‌ها خوانده نشده است.</section>");
+      ? "<form method='post' action='/admin/message/delete' class='message-delete-form'>" + csrf
+        + hidden("return_to", returnTo)
+        + "<section class='card chat-card'><div class='chat-stream'>" + messages + "</div>"
+        + "<div class='bulk-bar'><label class='check'><input type='checkbox' name='confirm_delete' required>حذف پیام‌ها دائمی است و قابل بازگشت نیست.</label>"
+        + "<button class='danger' type='submit'>حذف یک یا چند پیام انتخاب‌شده</button></div></section></form>"
+      : "<section class='card empty'>پیامی مطابق این صفحه و فیلترها پیدا نشد.</section>")
+    + pagination;
+}
+
+function messageFiltersForm(state, filters) {
+  const senderOptions = "<option value=''>همه فرستنده‌ها</option>" + state.senders.map(function (sender) {
+    return "<option value='" + escapeHtml(sender.id) + "'" + (filters.senderRef === sender.id ? " selected" : "") + ">"
+      + escapeHtml(sender.label) + "</option>";
+  }).join("");
+  const botOptions = "<option value=''>همه بات‌ها</option>" + state.bots.map(function (bot) {
+    return "<option value='" + escapeHtml(bot.id) + "'" + (filters.botId === bot.id ? " selected" : "") + ">"
+      + escapeHtml(bot.label) + "</option>";
+  }).join("");
+  const sizeOptions = MESSAGE_PAGE_SIZES.map(function (size) {
+    return "<option value='" + size + "'" + (filters.pageSize === size ? " selected" : "") + ">" + size + " پیام</option>";
+  }).join("");
+  return "<section class='card filters'><h2>فیلتر و جستجو</h2><form method='get' action='/admin'>"
+    + hidden("tab", "messages")
+    + "<div class='filter-grid'><div class='wide'><label>جستجو در متن، نام و بات</label><input type='search' name='q' maxlength='200' value='"
+    + escapeHtml(filters.query) + "' placeholder='عبارت موردنظر'></div>"
+    + "<div><label>فرستنده</label><select name='sender'>" + senderOptions + "</select></div>"
+    + "<div><label>بات</label><select name='message_bot'>" + botOptions + "</select></div>"
+    + "<div><label>از تاریخ</label><input type='date' name='from' value='" + escapeHtml(filters.from) + "'></div>"
+    + "<div><label>تا تاریخ</label><input type='date' name='to' value='" + escapeHtml(filters.to) + "'></div>"
+    + "<div><label>تعداد در صفحه</label><select name='page_size'>" + sizeOptions + "</select></div></div>"
+    + "<div class='actions'><button type='submit'>اعمال فیلتر</button><a class='btn secondary' href='/admin?tab=messages'>پاک‌کردن فیلترها</a></div></form></section>";
+}
+
+function messageFilterUrl(filters, page) {
+  const params = new URLSearchParams({ tab: "messages", page: String(page), page_size: String(filters.pageSize) });
+  if (filters.query) params.set("q", filters.query);
+  if (filters.senderRef) params.set("sender", filters.senderRef);
+  if (filters.botId) params.set("message_bot", filters.botId);
+  if (filters.from) params.set("from", filters.from);
+  if (filters.to) params.set("to", filters.to);
+  return "/admin?" + params.toString();
 }
 
 function chatSourcesPanel(sources, csrf) {
@@ -1415,6 +1597,9 @@ function chatSourcesPanel(sources, csrf) {
       + "<form method='post' action='/admin/chat-log/toggle' class='actions'>" + csrf
       + hidden("source_key", source.source_key)
       + (source.logEnabled ? "" : hidden("log_enabled", "on"))
+      + "<label class='check log-warning'><input type='checkbox' name='confirm' required>"
+      + (source.logEnabled ? "با غیرفعال‌سازی، پیام‌های جدید این سمت ذخیره نمی‌شوند؛ هشدارها فعال می‌مانند."
+        : "با فعال‌سازی، پیام‌های جدید این سمت در تاریخچه ذخیره می‌شوند.") + "</label>"
       + "<button class='" + (source.logEnabled ? "danger" : "secondary") + "' type='submit'>"
       + (source.logEnabled ? "غیرفعال‌کردن لاگ این سمت" : "فعال‌کردن لاگ این سمت")
       + "</button></form></div>";
@@ -1422,25 +1607,23 @@ function chatSourcesPanel(sources, csrf) {
   return "<section class='card'><h2>کنترل لاگ چت‌ها</h2><div class='source-grid'>" + cards + "</div></section>";
 }
 
-function sendersTab(state, bot, csrf) {
-  if (!bot) return emptyBots();
-  const botPicker = botPickerTabs(state, bot, "senders");
-  const senders = bot.senders.map(function (sender) {
-    return "<section class='card'>" + senderForm(bot, sender, csrf)
+function sendersTab(state, csrf) {
+  const senders = state.senders.map(function (sender) {
+    return "<section class='card'>" + senderForm(sender, csrf)
       + "<form method='post' action='/admin/sender/delete' class='actions'>" + csrf
-      + hidden("bot_id", bot.id) + hidden("sender_id", sender.id)
-      + "<button class='danger' type='submit'>حذف فرستنده و قوانین مرتبط</button></form></section>";
+      + hidden("sender_id", sender.id)
+      + "<button class='danger' type='submit'>حذف فرستنده و قوانین مرتبط در همه بات‌ها</button></form></section>";
   }).join("");
-  return pageHeader("فرستنده‌های " + bot.label, "برای هر شخص یک نام و شناسه عددی ثبت کن",
-    "/admin?tab=sender-new&bot=" + encodeURIComponent(bot.id), "＋ افزودن فرستنده")
-    + botPicker + (senders || "<section class='card empty'>هنوز فرستنده‌ای ثبت نشده است.</section>");
+  return pageHeader("فرستنده‌های مشترک", "هر فرستنده در هشدارهای همه بات‌ها قابل انتخاب است",
+    "/admin?tab=sender-new", "＋ افزودن فرستنده")
+    + (senders || "<section class='card empty'>هنوز فرستنده‌ای ثبت نشده است.</section>");
 }
 
 function rulesTab(state, bot, csrf) {
   if (!bot) return emptyBots();
   const botPicker = botPickerTabs(state, bot, "rules");
   const rules = bot.rules.map(function (rule) {
-    return "<section class='card'>" + ruleEditor(bot, rule, csrf)
+    return "<section class='card'>" + ruleEditor(bot, state.senders, rule, csrf)
       + "<form method='post' action='/admin/rule/delete' class='actions'>" + csrf
       + hidden("bot_id", bot.id) + hidden("rule_id", rule.id)
       + "<button class='danger' type='submit'>حذف هشدار</button></form></section>";
@@ -1458,14 +1641,38 @@ function botPickerTabs(state, selectedBot, tab) {
 }
 
 function guideTab(csrf) {
-  return pageHeader("راهنما", "ترتیب صحیح راه‌اندازی", "", "")
-    + "<section class='card'><ol class='hint'><li>از تب بات‌ها، بات جدید را اضافه کن.</li>"
-    + "<li>Secretary Mode همان بات را در BotFather فعال کن.</li>"
-    + "<li>بات را در Telegram → Settings → Chat Automation متصل کن.</li>"
-    + "<li>در تب فرستنده‌ها، شناسه عددی افراد را ثبت کن.</li>"
-    + "<li>در تب هشدارها، فرستنده و نوع فیلتر را انتخاب کن.</li>"
-    + "<li>حالت «هر پیام» با هر پیام آن فرستنده اجرا می‌شود؛ حالت «شامل عبارت» فقط با وجود عبارت در متن یا کپشن.</li>"
-    + "<li>اگر چند قانون منطبق باشند، همه پیام‌های هشدار مربوطه ارسال می‌شوند.</li></ol>"
+  return pageHeader("راهنمای کامل", "از ساخت بات تا مدیریت هشدار و تاریخچه", "", "")
+    + "<section class='card'><h2>۱. ساخت بات در تلگرام</h2><ol class='hint'>"
+    + "<li>در تلگرام وارد @BotFather شو و دستور /newbot را بفرست.</li>"
+    + "<li>یک نام و سپس username منتهی به bot انتخاب کن.</li>"
+    + "<li>توکن دریافتی را محرمانه نگه دار؛ هرکس آن را داشته باشد کنترل بات را دارد.</li>"
+    + "<li>در BotFather وارد Bot Settings همان بات شو و Secretary Mode را فعال کن.</li></ol></section>"
+    + "<section class='card'><h2>۲. افزودن بات به پنل</h2><ol class='hint'>"
+    + "<li>در تب «بات‌ها»، «افزودن بات جدید» را بزن و نام نمایشی و توکن را وارد کن.</li>"
+    + "<li>پنل اعتبار توکن را بررسی و webhook اختصاصی بات را ثبت می‌کند.</li>"
+    + "<li>برای ویرایش نام لازم نیست توکن را دوباره وارد کنی. فقط تغییر توکن باعث جایگزینی اتصال webhook می‌شود.</li></ol></section>"
+    + "<section class='card'><h2>۳. تعریف Chat Automation</h2><ol class='hint'>"
+    + "<li>در تلگرام حسابی که باید پیام‌هایش کنترل شود، Settings → Telegram Business → Chatbots یا Chat Automation را باز کن.</li>"
+    + "<li>username بات را وارد و چت‌های مجاز را انتخاب کن. برای حریم خصوصی بهتر، فقط چت‌های لازم را مجاز کن.</li>"
+    + "<li>پس از اتصال، وضعیت بات در نمای کلی از «منتظر اتصال» به «متصل» تغییر می‌کند.</li>"
+    + "<li>اگر دو طرف یک گفتگو همین بات را متصل کنند، هر پیام از دو مسیر دیده می‌شود؛ در بخش کنترل لاگ، ثبت یکی از دو سمت را خاموش کن.</li></ol></section>"
+    + "<section class='card'><h2>۴. فرستنده‌ها و هشدارها</h2><ol class='hint'>"
+    + "<li>فرستنده‌ها مشترک‌اند: هر شناسه عددی را یک‌بار ثبت کن و در قوانین تمام بات‌ها انتخاب کن.</li>"
+    + "<li>برای یافتن شناسه، یک پیام از آن حساب دریافت کن و نام را در صفحه پیام‌ها ببین؛ در صورت نیاز از بات‌های معتبر نمایش شناسه استفاده کن.</li>"
+    + "<li>در تب «هشدارها» ابتدا بات را انتخاب کن، سپس فرستنده، نوع فیلتر و متن هشدار را تعیین کن.</li>"
+    + "<li>«هر پیام» برای تمام پیام‌های فرستنده و «شامل عبارت» فقط برای متن یا کپشن دارای عبارت اجرا می‌شود.</li>"
+    + "<li>فاصله تکرار جلوی ارسال پشت‌سرهم یک قانون را می‌گیرد. اگر چند قانون منطبق باشند، همه اجرا می‌شوند.</li>"
+    + "<li>هشدار در چت خصوصی مالک همان اتصال و توسط همان بات ارسال می‌شود.</li></ol></section>"
+    + "<section class='card'><h2>۵. پیام‌ها و کنترل لاگ</h2><ol class='hint'>"
+    + "<li>پیام‌ها در D1 و محتوای آن‌ها به‌صورت رمزنگاری‌شده ذخیره می‌شود.</li>"
+    + "<li>می‌توانی بر اساس تاریخ، فرستنده و بات فیلتر کنی، متن را جستجو کنی و اندازه صفحه را تغییر دهی.</li>"
+    + "<li>خاموش‌کردن لاگ یک سمت فقط ذخیره تاریخچه را متوقف می‌کند و قوانین هشدار را خاموش نمی‌کند.</li>"
+    + "<li>حذف موردی یا گروهی پیام‌ها دائمی است؛ قبل از حذف باید هشدار را تأیید کنی.</li></ol></section>"
+    + "<section class='card'><h2>۶. عیب‌یابی سریع</h2><ul class='hint'>"
+    + "<li>«منتظر اتصال»: Secretary Mode یا Chat Automation هنوز وصل نیست.</li>"
+    + "<li>پیام ثبت می‌شود ولی هشدار نمی‌آید: فعال‌بودن بات، فرستنده، قانون، عبارت و فاصله تکرار را بررسی کن.</li>"
+    + "<li>پیام تکراری است: همان گفتگو از دو حساب متصل شده؛ لاگ یکی از دو منبع آینه‌ای را غیرفعال کن.</li>"
+    + "<li>توکن را هرگز در پیام، تصویر یا مخزن عمومی منتشر نکن؛ در صورت افشا آن را از BotFather تعویض کن.</li></ul>"
     + "<form method='post' action='/logout' class='actions'>" + csrf
     + "<button class='secondary' type='submit'>خروج از پنل</button></form></section>";
 }
@@ -1494,10 +1701,10 @@ function botForm(bot, csrf) {
     + "<div class='actions'><button type='submit'>" + (existing ? "ذخیره و فعال‌سازی وب‌هوک" : "افزودن بات") + "</button></div></form>";
 }
 
-function senderForm(bot, sender, csrf) {
+function senderForm(sender, csrf) {
   const existing = Boolean(sender);
-  const idSuffix = existing ? sender.id : "new_" + bot.id;
-  return "<form method='post' action='/admin/sender/save'>" + csrf + hidden("bot_id", bot.id)
+  const idSuffix = existing ? sender.id : "new_global";
+  return "<form method='post' action='/admin/sender/save'>" + csrf
     + (existing ? hidden("sender_id", sender.id) : "")
     + "<div class='grid'><div><label>نام فرستنده</label><input name='label' maxlength='80' required value='"
     + escapeHtml(existing ? sender.label : "") + "' placeholder='مثلاً سرور مانیتورینگ'></div>"
@@ -1509,13 +1716,13 @@ function senderForm(bot, sender, csrf) {
     + "<div class='actions'><button type='submit'>" + (existing ? "ذخیره فرستنده" : "افزودن فرستنده") + "</button></div></form>";
 }
 
-function ruleEditor(bot, rule, csrf) {
+function ruleEditor(bot, senders, rule, csrf) {
   const existing = Boolean(rule);
   const idSuffix = existing ? rule.id : "new_" + bot.id;
   const senderRef = existing ? rule.senderRef : "*";
   const matchType = existing ? rule.matchType : "any";
   const senderOptions = "<option value='*'" + (senderRef === "*" ? " selected" : "") + ">همه فرستنده‌ها</option>"
-    + bot.senders.map(function (sender) {
+    + senders.map(function (sender) {
       return "<option value='" + escapeHtml(sender.id) + "'" + (senderRef === sender.id ? " selected" : "") + ">"
         + escapeHtml(sender.label + " — " + sender.telegramId) + "</option>";
     }).join("");
